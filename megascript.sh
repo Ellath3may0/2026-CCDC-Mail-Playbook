@@ -6,7 +6,12 @@
 # Authentication is AD via LDAP or Kerberos. Those services are assumed to be
 # already configured and working, so this script only hardens, it does not configure.
 #
-# Usage: sudo ./megascript.sh
+# Usage: sudo ./megascript.sh [--no-apt]
+#   --no-apt (alias --report-only)
+#       Make no package changes at all: no apt update/install/reinstall/upgrade/purge
+#       and no snap removal. Everything that would have been done is logged instead
+#       as "REPORT-ONLY (not done)" lines in the final report. All other hardening
+#       (permissions, sysctl, sessions, remote-tool lockdown, ...) still runs.
 #
 # Layout:
 #   1. Bootstrap     : clean environment, shared variables and helpers
@@ -25,6 +30,22 @@
 # ignored across the exec below and are inherited by every child process.
 # Ctrl-C is deliberately left working so you can still abort.
 trap '' HUP PIPE TSTP TTIN TTOU
+
+# Options. Parsed before the re-exec below (which passes "$@" on) so --help works
+# without sudo and the flag survives the clean-environment restart.
+NO_PACKAGE_CHANGES=0
+for argument in "$@"; do
+  case $argument in
+    --no-apt|--report-only) NO_PACKAGE_CHANGES=1 ;;
+    -h|--help)
+      echo "Usage: sudo $0 [--no-apt|--report-only]"
+      echo "  --no-apt   make no package changes (no apt install/reinstall/upgrade/purge,"
+      echo "             no snap removal); log what would be repaired instead"
+      exit 0 ;;
+    *) echo "Unknown option: $argument (try --help)" >&2; exit 1 ;;
+  esac
+done
+readonly NO_PACKAGE_CHANGES
 
 # Require sudo, then re-run this script inside an empty environment so no
 # aliases, functions, bash profile, BASH_ENV, LD_PRELOAD or other inherited
@@ -100,6 +121,14 @@ ANCESTOR_PIDS=" $$ "
 #   Queue a message for the "Attention" section of the final report.
 add_warning() {
   printf '%s\n' "$*" >> "$WARNINGS_FILE"
+}
+
+# report_only_note MESSAGE
+#   --no-apt mode: log what would have been installed, reinstalled or removed and
+#   queue it for the final report.
+report_only_note() {
+  echo "[report-only] $*"
+  add_warning "REPORT-ONLY (not done): $*"
 }
 
 # build_owned_path_index
@@ -290,15 +319,19 @@ preflight_check_pam_and_login_binaries() {
   mapfile -t tampered_packages < <(find_tampered_packages "${auth_packages[@]}")
 
   if ((${#tampered_packages[@]} > 0)); then
-    add_preflight_finding "tampered auth packages, reinstalling: ${tampered_packages[*]}"
-    echo "  NOTICE: running apt-get --reinstall on tampered packages (may take a while, may wait for the dpkg lock)"
-    apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}" >> "$MAIN_LOG" 2>&1
+    if ((NO_PACKAGE_CHANGES)); then
+      add_preflight_finding "tampered auth packages, NOT reinstalled (--no-apt): ${tampered_packages[*]}"
+    else
+      add_preflight_finding "tampered auth packages, reinstalling: ${tampered_packages[*]}"
+      echo "  NOTICE: running apt-get --reinstall on tampered packages (may take a while, may wait for the dpkg lock)"
+      apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}" >> "$MAIN_LOG" 2>&1
 
-    for package in "${tampered_packages[@]}"; do
-      if package_failed_verification "$package"; then
-        add_preflight_finding "STILL TAMPERED after reinstall: $package"
-      fi
-    done
+      for package in "${tampered_packages[@]}"; do
+        if package_failed_verification "$package"; then
+          add_preflight_finding "STILL TAMPERED after reinstall: $package"
+        fi
+      done
+    fi
   fi
 
   # Every .so named in /etc/pam.d must exist and belong to a package.
@@ -460,12 +493,10 @@ PURGE_LIST_EOF
 # 3. STEPS (each runs in the background, output goes to MAIN_LOG)
 # =============================================================================
 
-# Restore Ubuntu default shell profiles for root and sysadmin, remove injected
-# PROMPT_COMMAND and environment variables, and drop LD_PRELOAD config.
-step_reset_shell_profiles() {
-  local account home_dir lock_holders
-
-  echo "[reset] $(date +%T) running apt-get update"
+# reinstall_shell_packages
+#   apt update + reinstall of bash and base-files, with hard caps so it cannot hang.
+reinstall_shell_packages() {
+  local lock_holders modified_files
 
   # If something holds the dpkg/apt lock, say who, so a stall is explainable.
   if command -v fuser > /dev/null; then
@@ -475,6 +506,7 @@ step_reset_shell_profiles() {
 
   # Refresh package lists first: --reinstall fetches the exact installed version,
   # which 404s if the lists are stale.
+  echo "[reset] $(date +%T) running apt-get update"
   NEEDRESTART_SUSPEND=1 timeout -k 10 120 apt-get update \
       -o DPkg::Lock::Timeout=90 \
       -o Acquire::Retries=0 \
@@ -498,7 +530,50 @@ step_reset_shell_profiles() {
       install bash base-files < /dev/null \
     || add_warning "could not reinstall bash/base-files defaults (lock held, stale package lists or mirror unreachable; see $MAIN_LOG)"
 
-  echo "[reset] $(date +%T) apt-get finished, resetting profiles"
+  echo "[reset] $(date +%T) apt-get finished"
+
+  modified_files=$(
+    {
+      verify_modified_files bash base-files
+      dpkg --verify bash base-files 2>/dev/null | grep -E ' c /etc/(profile|bash\.bashrc|skel/)'
+    } | sort -u
+  )
+  [[ -n $modified_files ]] \
+    && add_warning "bash/base-files STILL modified after reinstall: $(head -5 <<< "$modified_files" | tr '\n' ';')"
+}
+
+# Restore Ubuntu default shell profiles for root and sysadmin, remove injected
+# PROMPT_COMMAND and environment variables, and drop LD_PRELOAD config.
+step_reset_shell_profiles() {
+  local account home_dir modified_files
+
+  # The shell defaults come from the bash and base-files packages. Scan them with
+  # dpkg first and only touch apt if something was changed. verify_modified_files
+  # skips config files, so the ones that matter here (/etc/profile, bash.bashrc and
+  # the /etc/skel dotfiles) are checked explicitly as well.
+  echo "[reset] $(date +%T) scanning bash and base-files with dpkg --verify"
+  modified_files=$(
+    {
+      verify_modified_files bash base-files
+      dpkg --verify bash base-files 2>/dev/null | grep -E ' c /etc/(profile|bash\.bashrc|skel/)'
+    } | sort -u
+  )
+
+  if [[ -z $modified_files ]]; then
+    echo "[reset] $(date +%T) scan clean, skipping apt-get"
+  else
+    echo "[reset] modified files found:"
+    echo "$modified_files"
+    add_warning "bash/base-files failed dpkg verification: $(head -5 <<< "$modified_files" | tr '\n' ';')"
+
+    if ((NO_PACKAGE_CHANGES)); then
+      report_only_note "bash/base-files failed verification, would run: apt-get update; apt-get --reinstall install bash base-files"
+    else
+      reinstall_shell_packages
+    fi
+  fi
+
+  echo "[reset] $(date +%T) resetting profiles"
 
   [[ -f /etc/skel/.bashrc ]] || add_warning "/etc/skel/.bashrc missing"
 
@@ -564,14 +639,21 @@ step_kill_other_sessions() {
 step_install_fish() {
   local fish_path
 
-  apt-get update || add_warning "apt update failed"
-  apt-get "${APT_OPTIONS[@]}" install fish || add_warning "fish install failed"
+  if ((NO_PACKAGE_CHANGES)); then
+    command -v fish > /dev/null \
+      || report_only_note "fish not installed, would run: apt-get update; apt-get install fish"
+  else
+    apt-get update || add_warning "apt update failed"
+    apt-get "${APT_OPTIONS[@]}" install fish || add_warning "fish install failed"
+  fi
 
-  fish_path=$(command -v fish)
+  fish_path=$(command -v fish) || return 0   # nothing to register without fish
   grep -qx "$fish_path" /etc/shells || echo "$fish_path" >> /etc/shells
 }
 
 step_set_root_shell_to_fish() {
+  command -v fish > /dev/null || { add_warning "fish not installed, root shell left unchanged"; return 0; }
+
   chsh -s "$(command -v fish)" root || add_warning "could not set root shell to fish"
 }
 
@@ -582,6 +664,13 @@ step_remove_snap() {
   local keep_snapd=0
   local migrated_services=()
   local snap_name application_snaps
+
+  if ((NO_PACKAGE_CHANGES)); then
+    if command -v snap > /dev/null || dpkg -s snapd &> /dev/null; then
+      report_only_note "snap/snapd present, would migrate scored snaps to apt, remove all snaps and purge snapd. Snaps: $(timeout 10 snap list 2>/dev/null | awk 'NR>1 {print $1}' | tr '\n' ' ')"
+    fi
+    return 0
+  fi
 
   if command -v snap > /dev/null; then
 
@@ -643,6 +732,20 @@ step_remove_snap() {
 # (kernel, PHP, mail stack, auth libraries) first. After the upgrade it purges
 # the remote-access packages from PURGE_LIST_FILE.
 step_start_background_upgrade() {
+  local package upgradable_count purge_targets=""
+
+  if ((NO_PACKAGE_CHANGES)); then
+    upgradable_count=$(apt-get -s --with-new-pkgs upgrade 2>/dev/null | grep -c '^Inst')
+    report_only_note "apt upgrade skipped: $upgradable_count packages upgradable per the current package lists (no apt update was run)"
+
+    for package in $(cat "$PURGE_LIST_FILE"); do
+      [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null) == ii* ]] && purge_targets+=" $package"
+    done
+    [[ -n $purge_targets ]] && report_only_note "unscored remote-access packages installed, would purge:$purge_targets"
+
+    return 0
+  fi
+
   cat > "$WORK_DIR/upgrade.sh" <<'UPGRADE_SCRIPT_EOF'
 echo $$ > "$WORK_DIR/upgrade.pid"
 
@@ -729,9 +832,13 @@ step_check_bootloader() {
   modified_files=$(verify_modified_files "${boot_packages[@]}")
 
   if [[ -n $modified_files ]]; then
-    add_warning "bootloader/kernel files failed verification, reinstalling"
-    apt-get "${APT_OPTIONS[@]}" --reinstall install "${boot_packages[@]}"
-    reinstalled=1
+    if ((NO_PACKAGE_CHANGES)); then
+      report_only_note "bootloader/kernel files failed verification, would reinstall: ${boot_packages[*]} (changed: $(head -5 <<< "$modified_files" | tr '\n' ';'))"
+    else
+      add_warning "bootloader/kernel files failed verification, reinstalling"
+      apt-get "${APT_OPTIONS[@]}" --reinstall install "${boot_packages[@]}"
+      reinstalled=1
+    fi
   fi
 
   # Remove kernel parameters that give a shell or swap init.
@@ -866,6 +973,14 @@ step_check_binary_integrity() {
   mapfile -t tampered_packages < <(find_tampered_packages "${critical_packages[@]}")
 
   ((${#tampered_packages[@]} == 0)) && return 0
+
+  if ((NO_PACKAGE_CHANGES)); then
+    for package in "${tampered_packages[@]}"; do
+      changed_files=$(verify_modified_files "$package" | awk '{print $NF}' | head -3 | tr '\n' ' ')
+      report_only_note "binary integrity failed, would reinstall: $package ($changed_files)"
+    done
+    return 0
+  fi
 
   add_warning "binary integrity failed, reinstalling: ${tampered_packages[*]}"
   apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}"
@@ -1064,7 +1179,7 @@ step_reload_systemd() {
 # nftbuild (unknown side effects), and daemon-reload (must see every change).
 
 readonly -a STEPS=(
-  "40|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
+  "5|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
   "2|Change user and root passwords|step_change_passwords"
 
   "2|Kill other shell sessions|step_kill_other_sessions"
@@ -1115,6 +1230,8 @@ readonly -a APT_STEPS=(
 # announce_apt_step FUNCTION DESCRIPTION
 announce_apt_step() {
   local candidate
+
+  ((NO_PACKAGE_CHANGES)) && return 0
   for candidate in "${APT_STEPS[@]}"; do
     if [[ $candidate == "$1" ]]; then
       printf '\r\033[K  NOTICE: "%s" may run apt-get. It can wait for the dpkg lock (up to a few minutes). Do not interrupt it. Log: %s\n' "$2" "$MAIN_LOG"
@@ -1225,7 +1342,9 @@ report_results() {
 
   echo "--- apt upgrade (background) ---"
 
-  if [[ -f $UPGRADE_STATUS_FILE ]] && grep -q '^purge=' "$UPGRADE_STATUS_FILE"; then
+  if ((NO_PACKAGE_CHANGES)); then
+    echo "Skipped (--no-apt): no package changes were made. See the REPORT-ONLY lines above."
+  elif [[ -f $UPGRADE_STATUS_FILE ]] && grep -q '^purge=' "$UPGRADE_STATUS_FILE"; then
     echo "Finished: $(tr '\n' ' ' < "$UPGRADE_STATUS_FILE")"
   else
     echo "Still running. Live output (ends when it finishes):"
@@ -1236,8 +1355,13 @@ report_results() {
   echo "Logs: $MAIN_LOG  $UPGRADE_LOG (tmpfs, gone on reboot)"
 }
 
-echo "NOTICE: this script runs apt-get in several steps (reinstalls, snap removal, a full"
-echo "background upgrade). Steps may pause while waiting for the dpkg lock. Do not interrupt."
+if ((NO_PACKAGE_CHANGES)); then
+  echo "NOTICE: --no-apt: NO package changes will be made. Repairs that would need apt are"
+  echo "only logged (REPORT-ONLY lines in the final report)."
+else
+  echo "NOTICE: this script runs apt-get in several steps (reinstalls, snap removal, a full"
+  echo "background upgrade). Steps may pause while waiting for the dpkg lock. Do not interrupt."
+fi
 echo "If this terminal drops, the script keeps running. Reattach with: tail -f $MAIN_LOG"
 echo
 
