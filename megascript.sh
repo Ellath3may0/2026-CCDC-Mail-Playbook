@@ -177,6 +177,28 @@ quiesce_background_apt_jobs() {
                  unattended-upgrades.service 2>/dev/null
 }
 
+# protected_pids
+#   Print " pid pid ... " of everything the script must never kill: itself, every
+#   descendant (also the detached upgrade, which is reparented to init), anything in
+#   its own session, and its ancestors (ancestors' other children are NOT protected).
+protected_pids() {
+  local upgrade_pid
+  upgrade_pid=$(cat "$UPGRADE_PID_FILE" 2>/dev/null)
+
+  ps -e -o pid=,ppid=,sid= 2>/dev/null | awk -v me="$SCRIPT_PID" -v up="$upgrade_pid" -v anc="$ANCESTOR_PIDS" '
+    { par[$1]=$2; sid[$1]=$3; ids[NR]=$1 }
+    END {
+      keep[me]=1; if (up != "") keep[up]=1
+      do {
+        changed=0
+        for (i=1; i<=NR; i++) { p=ids[i]; if (!(p in keep) && (par[p] in keep)) { keep[p]=1; changed=1 } }
+      } while (changed)
+      for (i=1; i<=NR; i++) if (sid[ids[i]] == sid[me]) keep[ids[i]]=1
+      n=split(anc, a, " "); for (i=1; i<=n; i++) keep[a[i]]=1
+      printf " "; for (p in keep) printf "%s ", p
+    }'
+}
+
 build_owned_path_index
 quiesce_background_apt_jobs
 
@@ -237,25 +259,6 @@ preflight_check_ptrace_taps() {
     add_preflight_finding "pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null)) is traced by pid $tracer_pid ($(readlink "/proc/$tracer_pid/exe")), killing tracer"
     kill -9 "$tracer_pid"
   done < <(grep -s '^TracerPid:[[:space:]]*[1-9]' /proc/[0-9]*/status 2>/dev/null)
-}
-
-# preflight_check_input_device_readers
-#   Processes holding /dev/input open can log keystrokes. Unpackaged ones are
-#   killed, packaged ones (logind, Xorg) are only reported.
-preflight_check_input_device_readers() {
-  local pid exe_path
-
-  # One find over every fd directory, reduced to a unique list of PIDs.
-  while read -r pid; do
-    exe_path=$(readlink "/proc/$pid/exe" 2>/dev/null)
-
-    if [[ $exe_path != *'(deleted)' ]] && is_package_owned "$exe_path"; then
-      add_preflight_finding "packaged process reads /dev/input, review: pid $pid ($exe_path)"
-    else
-      add_preflight_finding "unpackaged process reads /dev/input, killing: pid $pid ($exe_path)"
-      kill -9 "$pid"
-    fi
-  done < <(find /proc/[0-9]*/fd -maxdepth 1 -lname '/dev/input/*' 2>/dev/null | cut -d/ -f3 | sort -u)
 }
 
 # preflight_check_tty_sniffers
@@ -352,23 +355,11 @@ preflight_check_ebpf_programs() {
   fi
 }
 
-# preflight_harden_input_and_tty
-#   Block ptrace by non-root, block TIOCSTI keystroke injection, make input
-#   devices root-only (now and via udev) and drop users from the input group.
-preflight_harden_input_and_tty() {
-  local input_group_member
-
+# preflight_harden_ptrace_and_tty
+#   Block ptrace by non-root and block TIOCSTI keystroke injection.
+preflight_harden_ptrace_and_tty() {
   sysctl -qw kernel.yama.ptrace_scope=2 >> "$MAIN_LOG" 2>&1
   sysctl -qw dev.tty.legacy_tiocsti=0   >> "$MAIN_LOG" 2>&1   # kernel 6.2+ only
-
-  chmod 600 /dev/input/event* /dev/input/mice /dev/input/mouse* 2>/dev/null
-
-  printf 'SUBSYSTEM=="input", GROUP="root", MODE="0600"\n' > /etc/udev/rules.d/99-megascript-input.rules
-  udevadm control --reload 2>/dev/null
-
-  for input_group_member in $(getent group input | cut -d: -f4 | tr ',' ' '); do
-    gpasswd -d "$input_group_member" input >> "$MAIN_LOG" 2>&1
-  done
 }
 
 # run_preflight
@@ -391,14 +382,13 @@ run_preflight() {
   preflight_check_ebpf_programs &
   background_scan_pids+=($!)
 
-  echo "  [1/8] preload hooks";                preflight_check_preload_hooks
-  echo "  [2/8] ptrace/strace taps";           preflight_check_ptrace_taps
-  echo "  [3/8] processes reading /dev/input"; preflight_check_input_device_readers
-  echo "  [4/8] tty sniffers";                 preflight_check_tty_sniffers
-  echo "  [5/8] PAM and login binaries";       preflight_check_pam_and_login_binaries
-  echo "  [6/8] kernel modules (parallel scan)"
-  echo "  [7/8] eBPF programs (parallel scan)"
-  echo "  [8/8] input and tty hardening";      preflight_harden_input_and_tty
+  echo "  [1/7] preload hooks";           preflight_check_preload_hooks
+  echo "  [2/7] ptrace/strace taps";      preflight_check_ptrace_taps
+  echo "  [3/7] tty sniffers";            preflight_check_tty_sniffers
+  echo "  [4/7] PAM and login binaries";  preflight_check_pam_and_login_binaries
+  echo "  [5/7] kernel modules (parallel scan)"
+  echo "  [6/7] eBPF programs (parallel scan)"
+  echo "  [7/7] ptrace and tty hardening"; preflight_harden_ptrace_and_tty
 
   wait "${background_scan_pids[@]}"
 
@@ -521,13 +511,28 @@ step_change_passwords() {
     || add_warning "root password change failed"
 }
 
-# Kill every logged-in terminal session except the one running this script.
+# Kill every logged-in terminal session except the one this script was started
+# from. With sudo's default use_pty the script runs on a private pty that `who`
+# never lists, so comparing against our own tty is not enough (it would kill the
+# real login terminal, and us with it). The terminals of every parent process
+# (login shell, ssh session, tmux) are protected as well.
 step_kill_other_sessions() {
-  local terminal
+  local protected_ttys=" ${INVOKING_TTY#/dev/} "
+  local ancestor_pid ancestor_tty terminal pid protected
 
+  for ancestor_pid in $ANCESTOR_PIDS; do
+    ancestor_tty=$(ps -o tty= -p "$ancestor_pid" 2>/dev/null | tr -d ' ')
+    [[ -n $ancestor_tty && $ancestor_tty != '?' ]] && protected_ttys+="$ancestor_tty "
+  done
+
+  # Never `pkill -t`: it kills everything on the tty, including our own tree.
   who | awk '{print $2}' | sort -u | while read -r terminal; do
-    [[ "/dev/$terminal" == "$INVOKING_TTY" ]] && continue
-    pkill -9 -t "$terminal"
+    [[ $protected_ttys == *" $terminal "* ]] && continue
+
+    protected=" $(protected_pids) "
+    for pid in $(ps -t "$terminal" -o pid= 2>/dev/null); do
+      [[ $protected == *" $pid "* ]] || kill -9 "$pid"
+    done
   done
 }
 
@@ -975,18 +980,22 @@ step_remove_temp_files() {
 # binaries replaced by the upgrade are NOT killed (that would take down sshd and
 # friends), they are listed as "restart needed" instead.
 step_stop_memory_only_processes() {
-  local exe_link pid exe_path binary_path
+  local exe_link pid exe_path binary_path protected
 
   # One find lists only the /proc/<pid>/exe links that point at deleted/memfd files.
   while read -r exe_link; do
     pid=${exe_link#/proc/}
     pid=${pid%/exe}
-    [[ $pid == "$SCRIPT_PID" ]] && continue
+    protected=" $(protected_pids) "
+    [[ $protected == *" $pid "* ]] && continue
 
     exe_path=$(readlink "$exe_link" 2>/dev/null) || continue
     binary_path=${exe_path% (deleted)}
 
-    if [[ $exe_path != /memfd:* ]] && is_package_owned "$binary_path"; then
+    # The index can be stale or half-written while the background upgrade runs,
+    # so fall back to a live dpkg lookup before deciding a binary is unpackaged.
+    if [[ $exe_path != /memfd:* ]] && { is_package_owned "$binary_path" \
+         || dpkg -S "$binary_path" &>/dev/null || dpkg -S "${binary_path#/usr}" &>/dev/null; }; then
       add_warning "packaged binary updated, restart needed: pid $pid ($binary_path)"
       continue
     fi
