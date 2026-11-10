@@ -44,6 +44,8 @@ if [[ -z ${MEGASCRIPT_CLEAN_ENV:-} ]]; then
     TERM="${TERM:-xterm}" \
     LANG=C.UTF-8 \
     DEBIAN_FRONTEND=noninteractive \
+    NEEDRESTART_SUSPEND=1 \
+    APT_LISTCHANGES_FRONTEND=none \
     /bin/bash --noprofile --norc "$(readlink -f "$0")" "$@"
 fi
 
@@ -52,13 +54,32 @@ unalias -a 2>/dev/null
 hash -r
 umask 077
 
+# Never let a shell idle timeout apply to this run.
+unset TMOUT
+
 # Disable Ctrl-S/Ctrl-Q flow control so an accidental Ctrl-S cannot freeze the
 # output (and therefore the script). Terminal settings are restored on exit.
 ORIGINAL_TTY_SETTINGS=$(stty -g 2>/dev/null)
 stty -ixon 2>/dev/null
-trap '[[ -n $ORIGINAL_TTY_SETTINGS ]] && stty "$ORIGINAL_TTY_SETTINGS" 2>/dev/null' EXIT
 
 SCRIPT_PID=$$
+
+# Keepalive: every 15s write an invisible escape sequence to the terminal so
+# NAT, firewall and client idle timers never see a quiet connection. It stops
+# by itself when this script exits.
+KEEPALIVE_PID=
+if [[ -w ${INVOKING_TTY:-} ]]; then
+  (
+    while kill -0 "$SCRIPT_PID" 2>/dev/null; do
+      sleep 15
+      printf '\033[0m' > "$INVOKING_TTY" 2>/dev/null
+    done
+  ) &
+  KEEPALIVE_PID=$!
+fi
+
+trap '[[ -n $KEEPALIVE_PID ]] && kill "$KEEPALIVE_PID" 2>/dev/null
+      [[ -n $ORIGINAL_TTY_SETTINGS ]] && stty "$ORIGINAL_TTY_SETTINGS" 2>/dev/null' EXIT
 
 # Private working directory on tmpfs (cleared on reboot). Holds logs and state.
 WORK_DIR=/run/megascript
@@ -109,9 +130,14 @@ build_owned_path_index() {
 
 # is_package_owned PATH
 #   True if an installed package ships PATH (symlinks resolved, /usr merged).
+#   An empty or unresolvable path counts as NOT owned.
 is_package_owned() {
   local resolved_path
+
+  [[ -n $1 ]] || return 1
+
   resolved_path=$(readlink -f "$1")
+  [[ -n $resolved_path ]] || return 1
 
   [[ $resolved_path == /usr/* ]] && resolved_path=${resolved_path#/usr}
 
@@ -258,7 +284,7 @@ preflight_check_pam_and_login_binaries() {
 
   if ((${#tampered_packages[@]} > 0)); then
     add_preflight_finding "tampered auth packages, reinstalling: ${tampered_packages[*]}"
-    apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}" >> "$MAIN_LOG" 2>&1
+    apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}" >> "$MAIN_LOG" 2>&1 < /dev/null
 
     for package in "${tampered_packages[@]}"; do
       if package_failed_verification "$package"; then
@@ -276,7 +302,7 @@ preflight_check_pam_and_login_binaries() {
         if [[ $module_name == /* ]]; then
           module_path=$module_name
         else
-          module_path=$(ls /usr/lib/*/security/"$module_name" /usr/lib/security/"$module_name" /lib/security/"$module_name" 2>/dev/null | head -1)
+          module_path=$(find -H /usr/lib /lib -maxdepth 3 -path "*/security/$module_name" -print -quit 2>/dev/null)
         fi
 
         if [[ -z $module_path || ! -e $module_path ]]; then
@@ -435,15 +461,25 @@ step_reset_shell_profiles() {
   local account home_dir
 
   # /etc/skel, /etc/profile and /etc/bash.bashrc come from these packages.
-  # Short timeouts so a held lock or unreachable mirror cannot stall the run.
-  timeout 180 apt-get -y --reinstall \
-      -o Dpkg::Options::=--force-confnew \
-      -o DPkg::Lock::Timeout=60 \
-      -o Acquire::Retries=0 \
-      -o Acquire::http::Timeout=15 \
-      -o Acquire::https::Timeout=15 \
-      install bash base-files \
-    || add_warning "could not reinstall bash/base-files defaults (lock held or mirror unreachable)"
+  # Only the download gets a timeout: killing apt/dpkg mid-install would leave
+  # dpkg half-configured and break every later apt call. The install itself
+  # then needs no network, runs unattended and waits for the lock if needed.
+  dpkg --configure -a < /dev/null
+
+  if timeout -k 5 120 apt-get -y -d --reinstall \
+        -o Acquire::Retries=0 \
+        -o Acquire::http::Timeout=15 \
+        -o Acquire::https::Timeout=15 \
+        -o DPkg::Lock::Timeout=60 \
+        install bash base-files < /dev/null; then
+    apt-get -y --reinstall \
+        -o Dpkg::Options::=--force-confnew \
+        -o DPkg::Lock::Timeout=300 \
+        install bash base-files < /dev/null \
+      || add_warning "bash/base-files reinstall failed"
+  else
+    add_warning "could not download bash/base-files (lock held or mirror unreachable)"
+  fi
 
   [[ -f /etc/skel/.bashrc ]] || add_warning "/etc/skel/.bashrc missing"
 
@@ -498,12 +534,16 @@ step_install_fish() {
   apt-get update || add_warning "apt update failed"
   apt-get "${APT_OPTIONS[@]}" install fish || add_warning "fish install failed"
 
-  fish_path=$(command -v fish)
+  fish_path=$(command -v fish) || return 0
   grep -qx "$fish_path" /etc/shells || echo "$fish_path" >> /etc/shells
 }
 
 step_set_root_shell_to_fish() {
-  chsh -s "$(command -v fish)" root || add_warning "could not set root shell to fish"
+  local fish_path
+
+  fish_path=$(command -v fish) || { add_warning "fish missing, root shell unchanged"; return 1; }
+
+  chsh -s "$fish_path" root || add_warning "could not set root shell to fish"
 }
 
 # Remove snap entirely. Any snap that looks like a scored or supporting service
@@ -533,15 +573,15 @@ step_remove_snap() {
     # Remove applications first (a few passes for dependency order).
     for pass_number in 1 2 3; do
       for snap_name in $(snap list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Ev '^(snapd|core[0-9]*|bare)$'); do
-        snap remove --purge "$snap_name"
+        timeout 120 snap remove --purge "$snap_name"
       done
     done
 
     # Then bases (core*, bare, gnome-*), then snapd itself.
     for snap_name in $(snap list 2>/dev/null | awk 'NR>1 {print $1}' | grep -v '^snapd$'); do
-      snap remove --purge "$snap_name"
+      timeout 120 snap remove --purge "$snap_name"
     done
-    snap remove --purge snapd
+    timeout 120 snap remove --purge snapd
   fi
 
   systemctl disable --now snapd.service snapd.socket snapd.seeded.service 2>/dev/null
@@ -569,7 +609,8 @@ step_remove_snap() {
 
 # Start `apt upgrade` detached in the background, security-relevant packages
 # (kernel, PHP, mail stack, auth libraries) first. After the upgrade it purges
-# the remote-access packages from PURGE_LIST_FILE.
+# the remote-access packages from PURGE_LIST_FILE. This runs AFTER the integrity,
+# bootloader, permission and temp-file steps so none of them race with dpkg.
 step_start_background_upgrade() {
   cat > "$WORK_DIR/upgrade.sh" <<'UPGRADE_SCRIPT_EOF'
 echo $$ > "$WORK_DIR/upgrade.pid"
@@ -611,8 +652,14 @@ UPGRADE_SCRIPT_EOF
 
 # Wait for the parallel nftbuild download, install it and run it.
 step_run_nftbuild() {
+  local waited=0
+
   while [[ ! -f $NFTBUILD_FETCH_STATUS_FILE ]]; do
     sleep 1
+    if ((++waited > 200)); then
+      add_warning "nftbuild download timed out"
+      return 1
+    fi
   done
 
   if [[ $(cat "$NFTBUILD_FETCH_STATUS_FILE") != 0 ]]; then
@@ -651,17 +698,22 @@ step_check_bootloader() {
 
   boot_packages=$(installed_packages_matching '^(grub|shim|linux-image|linux-modules)')
 
+  # With no package names dpkg --verify would check the whole system.
+  [[ -n $boot_packages ]] || { add_warning "no bootloader/kernel packages found"; return 1; }
+
   list_tampered_boot_files() {
-    dpkg --verify $boot_packages 2>/dev/null | grep -v ' c /'
+    dpkg --verify "$boot_packages" 2>/dev/null | grep -v ' c /'
   }
 
   if [[ -n $(list_tampered_boot_files) ]]; then
     add_warning "bootloader/kernel files failed verification, reinstalling"
-    apt-get "${APT_OPTIONS[@]}" --reinstall install $boot_packages
+    apt-get "${APT_OPTIONS[@]}" --reinstall install "$boot_packages"
   fi
 
-  # Remove kernel parameters that give a shell or swap init.
-  sed -i -E 's/ ?(init=[^" ]*|rd\.break[^" ]*|systemd\.unit=[^" ]*|single)//g' /etc/default/grub
+  # Remove kernel parameters that give a shell or swap init (including drop-ins
+  # such as /etc/default/grub.d/50-cloudimg-settings.cfg).
+  sed -i -E 's/ ?(init=[^" ]*|rd\.break[^" ]*|systemd\.unit=[^" ]*|single)//g' \
+    /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null
 
   grep -rEl 'init=/|rd\.break' /etc/grub.d 2>/dev/null | while read -r script_path; do
     add_warning "suspicious grub.d script: $script_path"
@@ -685,6 +737,8 @@ step_check_bootloader() {
 # authorized_keys files are deliberately never touched (another tool manages them).
 step_fix_permissions() {
   local home_dir home_user suid_file
+
+  shopt -s nullglob   # an empty /home must not yield a literal "/home/*"
 
   # --- Top-level directories ---
   chown root:root / /etc /root
@@ -730,6 +784,8 @@ step_fix_permissions() {
   chmod 644 /etc/crontab
 
   # --- home directories: owned by their user, private ---
+  # A home whose user cannot be resolved (for example the AD server is
+  # unreachable) is left alone: chowning it to root would break mail access.
   for home_dir in /home/*/; do
     home_dir=${home_dir%/}
     home_user=${home_dir##*/}
@@ -737,8 +793,8 @@ step_fix_permissions() {
     if id "$home_user" &>/dev/null; then
       find "$home_dir" ! -name 'authorized_keys*' -exec chown -h "$home_user:$(id -gn "$home_user")" {} +
     else
-      find "$home_dir" ! -name 'authorized_keys*' -exec chown -h root:root {} +
-      add_warning "home without user: $home_dir"
+      add_warning "home without resolvable user (left untouched): $home_dir"
+      continue
     fi
 
     chmod 700 "$home_dir"
@@ -892,14 +948,18 @@ step_check_mail_and_php() {
     | while read -r php_file; do
         add_warning "phpinfo() found: $php_file"
       done
+
+  return 0
 }
 
 # Delete temporary files. systemd-private-* dirs are kept because running
-# services (PrivateTmp=) depend on them.
+# services (PrivateTmp=) depend on them, tmux-* so you can reattach to tmux.
 step_remove_temp_files() {
-  find /tmp /var/tmp -xdev -mindepth 1 -maxdepth 1 ! -name 'systemd-private-*' -exec rm -rf {} + 2>/dev/null
+  find /tmp /var/tmp -xdev -mindepth 1 -maxdepth 1 \
+       ! -name 'systemd-private-*' ! -name 'tmux-*' -exec rm -rf {} + 2>/dev/null
 
   rm -rf /dev/shm/* /var/crash/* /root/.cache 2>/dev/null
+  return 0
 }
 
 # Kill processes running from memory only (deleted binary or memfd). Package
@@ -941,6 +1001,9 @@ step_reload_systemd() {
 # Format: "estimated seconds|description|function"
 # Estimates drive the progress bar and ETA, and are rescaled by how fast the
 # earlier steps actually ran.
+#
+# Order matters: the background upgrade starts only after every step that
+# verifies or rewrites packaged files, so none of them race with dpkg.
 
 STEPS=(
   "25|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
@@ -949,15 +1012,15 @@ STEPS=(
   "60|apt update and install fish|step_install_fish"
   "1|Set root shell to fish|step_set_root_shell_to_fish"
   "60|Migrate scored snaps, remove snap|step_remove_snap"
-  "3|Start background apt upgrade|step_start_background_upgrade"
   "20|Run nftbuild|step_run_nftbuild"
   "15|Disable unscored remote access tools|step_disable_remote_access_tools"
   "40|Check and fix bootloader|step_check_bootloader"
   "40|Fix permissions and ownership|step_fix_permissions"
   "60|Binary integrity check|step_check_binary_integrity"
   "3|Apply sysctl hardening|step_apply_sysctl_hardening"
-  "5|Mail and PHP read-only checks|step_check_mail_and_php"
   "3|Remove temp files|step_remove_temp_files"
+  "3|Start background apt upgrade|step_start_background_upgrade"
+  "5|Mail and PHP read-only checks|step_check_mail_and_php"
   "3|Stop memory-only processes|step_stop_memory_only_processes"
   "2|Daemon reload|step_reload_systemd"
 )
@@ -994,7 +1057,7 @@ run_all_steps() {
     step_number=$((step_number + 1))
     step_start=$SECONDS
 
-    "$function_name" >> "$MAIN_LOG" 2>&1 &
+    "$function_name" >> "$MAIN_LOG" 2>&1 < /dev/null &
     step_pid=$!
 
     while kill -0 "$step_pid" 2>/dev/null; do
