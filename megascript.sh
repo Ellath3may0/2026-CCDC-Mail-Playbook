@@ -172,9 +172,9 @@ find_tampered_packages() {
 #   Stop Ubuntu's own apt timers and unattended-upgrades, which often hold the
 #   dpkg lock at boot and would stall every apt call in this script.
 quiesce_background_apt_jobs() {
-  systemctl stop apt-daily.timer apt-daily-upgrade.timer \
+  timeout -k 5 60 systemctl stop apt-daily.timer apt-daily-upgrade.timer \
                  apt-daily.service apt-daily-upgrade.service \
-                 unattended-upgrades.service 2>/dev/null
+                 unattended-upgrades.service packagekit.service 2>/dev/null
 }
 
 # protected_pids
@@ -291,6 +291,7 @@ preflight_check_pam_and_login_binaries() {
 
   if ((${#tampered_packages[@]} > 0)); then
     add_preflight_finding "tampered auth packages, reinstalling: ${tampered_packages[*]}"
+    echo "  NOTICE: running apt-get --reinstall on tampered packages (may take a while, may wait for the dpkg lock)"
     apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}" >> "$MAIN_LOG" 2>&1
 
     for package in "${tampered_packages[@]}"; do
@@ -462,18 +463,42 @@ PURGE_LIST_EOF
 # Restore Ubuntu default shell profiles for root and sysadmin, remove injected
 # PROMPT_COMMAND and environment variables, and drop LD_PRELOAD config.
 step_reset_shell_profiles() {
-  local account home_dir
+  local account home_dir lock_holders
 
-  # /etc/skel, /etc/profile and /etc/bash.bashrc come from these packages.
-  # Short timeouts so a held lock or unreachable mirror cannot stall the run.
-  timeout 300 apt-get -y --reinstall \
-      -o Dpkg::Options::=--force-confnew \
-      -o DPkg::Lock::Timeout=240 \
+  echo "[reset] $(date +%T) running apt-get update"
+
+  # If something holds the dpkg/apt lock, say who, so a stall is explainable.
+  if command -v fuser > /dev/null; then
+    lock_holders=$(fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>&1)
+    [[ -n $lock_holders ]] && echo "[reset] lock currently held by: $lock_holders"
+  fi
+
+  # Refresh package lists first: --reinstall fetches the exact installed version,
+  # which 404s if the lists are stale.
+  NEEDRESTART_SUSPEND=1 timeout -k 10 120 apt-get update \
+      -o DPkg::Lock::Timeout=90 \
       -o Acquire::Retries=0 \
       -o Acquire::http::Timeout=15 \
       -o Acquire::https::Timeout=15 \
-      install bash base-files \
-    || add_warning "could not reinstall bash/base-files defaults (lock held or mirror unreachable)"
+      < /dev/null \
+    || add_warning "apt-get update failed in profile reset step (lock held or mirror unreachable; see $MAIN_LOG)"
+
+  echo "[reset] $(date +%T) reinstalling bash and base-files with apt-get"
+
+  # Hard caps so this can never hang the run: 90 s waiting for the lock, 150 s total
+  # (then SIGKILL). No pty and no needrestart hook (it scans and can restart
+  # services, including ssh, mid-run), stdin closed so nothing can wait for input.
+  NEEDRESTART_SUSPEND=1 timeout -k 10 150 apt-get -y --reinstall \
+      -o Dpkg::Options::=--force-confnew \
+      -o DPkg::Lock::Timeout=90 \
+      -o Dpkg::Use-Pty=0 \
+      -o Acquire::Retries=0 \
+      -o Acquire::http::Timeout=15 \
+      -o Acquire::https::Timeout=15 \
+      install bash base-files < /dev/null \
+    || add_warning "could not reinstall bash/base-files defaults (lock held, stale package lists or mirror unreachable; see $MAIN_LOG)"
+
+  echo "[reset] $(date +%T) apt-get finished, resetting profiles"
 
   [[ -f /etc/skel/.bashrc ]] || add_warning "/etc/skel/.bashrc missing"
 
@@ -486,9 +511,8 @@ step_reset_shell_profiles() {
   sed -i '/PROMPT_COMMAND/d' /etc/profile.d/*.sh 2>/dev/null
 
   for account in root sysadmin; do
-    id "$account" &>/dev/null || continue
-
-    home_dir=$(getent passwd "$account" | cut -d: -f6)
+    # Local accounts only: a plain getent would query sssd/LDAP and can stall.
+    home_dir=$(getent -s files passwd "$account" | cut -d: -f6)
     [[ -d $home_dir ]] || continue
 
     rm -f "$home_dir"/.bashrc "$home_dir"/.profile "$home_dir"/.bash_profile \
@@ -1026,7 +1050,9 @@ step_reload_systemd() {
 #     Integrity must finish before any apt step starts, otherwise dpkg --verify
 #     could see a half-installed package and report false tampering.
 #
-#   Group 2 (apt chain: profiles -> fish -> root shell -> snap):
+#   Step 1 (profile reset) runs first and alone, before passwords are applied.
+#
+#   Group 2 (apt chain: fish -> root shell -> snap):
 #     runs alongside the bootloader check (grub, initramfs, no apt unless tampered).
 #     The background upgrade is only started AFTER the bootloader step, so it can
 #     never run update-initramfs at the same time as ours.
@@ -1038,6 +1064,7 @@ step_reload_systemd() {
 # nftbuild (unknown side effects), and daemon-reload (must see every change).
 
 readonly -a STEPS=(
+  "40|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
   "2|Change user and root passwords|step_change_passwords"
 
   "2|Kill other shell sessions|step_kill_other_sessions"
@@ -1045,7 +1072,6 @@ readonly -a STEPS=(
   "8|Binary integrity check (parallel)|step_check_binary_integrity"
   "1|Apply sysctl hardening (parallel)|step_apply_sysctl_hardening"
 
-  "20|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
   "45|apt update and install fish|step_install_fish"
   "1|Set root shell to fish|step_set_root_shell_to_fish"
   "90|Migrate scored snaps, remove snap|step_remove_snap"
@@ -1069,7 +1095,7 @@ readonly -a OVERLAPPED_STEPS=(
   "step_check_binary_integrity:step_kill_other_sessions"
   "step_apply_sysctl_hardening:step_kill_other_sessions"
 
-  "step_check_bootloader:step_reset_shell_profiles"
+  "step_check_bootloader:step_install_fish"
 
   "step_check_mail_and_php:step_fix_permissions"
   "step_remove_temp_files:step_fix_permissions"
@@ -1079,6 +1105,23 @@ readonly -a OVERLAPPED_STEPS=(
 # =============================================================================
 # 5. RUNNER AND FINAL REPORT
 # =============================================================================
+
+# Steps that call apt-get. A notice is printed on the terminal when they start.
+readonly -a APT_STEPS=(
+  step_reset_shell_profiles step_check_binary_integrity step_install_fish
+  step_remove_snap step_check_bootloader step_start_background_upgrade
+)
+
+# announce_apt_step FUNCTION DESCRIPTION
+announce_apt_step() {
+  local candidate
+  for candidate in "${APT_STEPS[@]}"; do
+    if [[ $candidate == "$1" ]]; then
+      printf '\r\033[K  NOTICE: "%s" may run apt-get. It can wait for the dpkg lock (up to a few minutes). Do not interrupt it. Log: %s\n' "$2" "$MAIN_LOG"
+      return
+    fi
+  done
+}
 
 BAR_FILLED='##############################'
 BAR_EMPTY='..............................'
@@ -1100,9 +1143,12 @@ run_all_steps() {
   local speed_ratio_percent eta_seconds exit_code
   local overlap overlapped_function trigger_function
   local -A early_pids=()   # step function -> PID of a step already running in parallel
+  local -A step_description=()   # step function -> description
 
   for step_entry in "${STEPS[@]}"; do
     total_estimate_seconds=$((total_estimate_seconds + ${step_entry%%|*}))
+    IFS='|' read -r _ description function_name <<< "$step_entry"
+    step_description[$function_name]=$description
   done
 
   for step_entry in "${STEPS[@]}"; do
@@ -1116,6 +1162,7 @@ run_all_steps() {
       trigger_function=${overlap##*:}
 
       if [[ $trigger_function == "$function_name" ]]; then
+        announce_apt_step "$overlapped_function" "${step_description[$overlapped_function]}"
         "$overlapped_function" >> "$MAIN_LOG" 2>&1 &
         early_pids[$overlapped_function]=$!
       fi
@@ -1124,6 +1171,7 @@ run_all_steps() {
     if [[ -n ${early_pids[$function_name]:-} ]]; then
       step_pid=${early_pids[$function_name]}   # already running, only wait for it
     else
+      announce_apt_step "$function_name" "$description"
       "$function_name" >> "$MAIN_LOG" 2>&1 &
       step_pid=$!
     fi
@@ -1188,6 +1236,8 @@ report_results() {
   echo "Logs: $MAIN_LOG  $UPGRADE_LOG (tmpfs, gone on reboot)"
 }
 
+echo "NOTICE: this script runs apt-get in several steps (reinstalls, snap removal, a full"
+echo "background upgrade). Steps may pause while waiting for the dpkg lock. Do not interrupt."
 echo "If this terminal drops, the script keeps running. Reattach with: tail -f $MAIN_LOG"
 echo
 
