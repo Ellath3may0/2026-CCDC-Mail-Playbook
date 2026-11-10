@@ -1151,9 +1151,17 @@ step_reload_systemd() {
 # =============================================================================
 # 4. STEP TABLE
 # =============================================================================
-# Format: "estimated seconds|description|function"
-# Estimates are tuned for a 2 vCPU / 4 GB VM. They drive the progress bar and ETA,
-# and are rescaled by how fast the earlier steps actually ran.
+# Format: "estimated seconds|description|function|time profile"
+# Estimates are tuned for a 2 vCPU / 4 GB VM. They drive the progress bar and ETA.
+#
+# TIME PROFILE says what the step's time is spent on:
+#   net   network  (apt mirrors, downloads)
+#   disk  disk I/O (find /, dpkg verification, rm, unpacking packages)
+#   cpu   CPU      (hashing, compression, password hashing, process scans)
+# A step can mix them as percentages that add up to 100, e.g. "net:70,disk:20,cpu:10".
+# The runner learns a speed ratio per kind from the steps that already finished (a
+# slow mirror stretches only network time, a slow disk only disk time) and rescales
+# the remaining estimates accordingly.
 #
 # PARALLELISM. A step listed in OVERLAPPED_STEPS is started the moment its
 # "trigger" step starts, and its own row below only waits for it (so its estimate
@@ -1179,28 +1187,28 @@ step_reload_systemd() {
 # nftbuild (unknown side effects), and daemon-reload (must see every change).
 
 readonly -a STEPS=(
-  "5|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
-  "2|Change user and root passwords|step_change_passwords"
+  "5|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles|disk:60,cpu:40"
+  "2|Change user and root passwords|step_change_passwords|cpu"
 
-  "2|Kill other shell sessions|step_kill_other_sessions"
-  "1|Disable unscored remote access tools (parallel)|step_disable_remote_access_tools"
-  "8|Binary integrity check (parallel)|step_check_binary_integrity"
-  "1|Apply sysctl hardening (parallel)|step_apply_sysctl_hardening"
+  "2|Kill other shell sessions|step_kill_other_sessions|cpu"
+  "1|Disable unscored remote access tools (parallel)|step_disable_remote_access_tools|cpu"
+  "8|Binary integrity check (parallel)|step_check_binary_integrity|disk:70,cpu:30"
+  "1|Apply sysctl hardening (parallel)|step_apply_sysctl_hardening|cpu"
 
-  "45|apt update and install fish|step_install_fish"
-  "1|Set root shell to fish|step_set_root_shell_to_fish"
-  "90|Migrate scored snaps, remove snap|step_remove_snap"
-  "5|Check and fix bootloader (parallel)|step_check_bootloader"
-  "2|Start background apt upgrade|step_start_background_upgrade"
+  "45|apt update and install fish|step_install_fish|net:70,disk:20,cpu:10"
+  "1|Set root shell to fish|step_set_root_shell_to_fish|cpu"
+  "90|Migrate scored snaps, remove snap|step_remove_snap|disk:70,net:20,cpu:10"
+  "5|Check and fix bootloader (parallel)|step_check_bootloader|cpu:50,disk:50"
+  "2|Start background apt upgrade|step_start_background_upgrade|disk"
 
-  "15|Run nftbuild|step_run_nftbuild"
+  "15|Run nftbuild|step_run_nftbuild|net:50,cpu:50"
 
-  "45|Fix permissions and ownership|step_fix_permissions"
-  "2|Mail and PHP read-only checks (parallel)|step_check_mail_and_php"
-  "1|Remove temp files (parallel)|step_remove_temp_files"
-  "1|Stop memory-only processes (parallel)|step_stop_memory_only_processes"
+  "45|Fix permissions and ownership|step_fix_permissions|disk:80,cpu:20"
+  "2|Mail and PHP read-only checks (parallel)|step_check_mail_and_php|disk"
+  "1|Remove temp files (parallel)|step_remove_temp_files|disk"
+  "1|Stop memory-only processes (parallel)|step_stop_memory_only_processes|cpu"
 
-  "3|Daemon reload|step_reload_systemd"
+  "3|Daemon reload|step_reload_systemd|cpu"
 )
 
 # Steps to launch early. Format: "step to start early:step that triggers it".
@@ -1245,33 +1253,154 @@ BAR_EMPTY='..............................'
 BAR_WIDTH=30
 readonly BAR_FILLED BAR_EMPTY BAR_WIDTH
 
+# ---- Timing model -----------------------------------------------------------
+# Per-kind (network / disk / cpu) speed ratios, learned while the run progresses.
+# A ratio of 100 means "as estimated", 200 means twice as slow.
+
+readonly RATIO_PRIOR_MS=10000                     # evidence a fresh ratio starts with
+readonly RATIO_MIN_PERCENT=25 RATIO_MAX_PERCENT=400
+
+STEP_ESTIMATE_MS=()                               # per step, indexed like STEPS
+STEP_WEIGHT_NET=() STEP_WEIGHT_DISK=() STEP_WEIGHT_CPU=()   # per step, percent
+
+TIMING_ACTUAL_NET=0  TIMING_ACTUAL_DISK=0  TIMING_ACTUAL_CPU=0     # ms really spent
+TIMING_ESTIMATE_NET=0 TIMING_ESTIMATE_DISK=0 TIMING_ESTIMATE_CPU=0  # ms estimated
+TIMING_RATIO_NET=100 TIMING_RATIO_DISK=100 TIMING_RATIO_CPU=100
+
+# set_now_ms
+#   Set NOW_MS to the current time in milliseconds (whole seconds on bash < 5).
+set_now_ms() {
+  local microseconds=${EPOCHREALTIME:-}
+
+  if [[ -n $microseconds ]]; then
+    microseconds=${microseconds/[.,]/}
+    NOW_MS=$((microseconds / 1000))
+  else
+    NOW_MS=$((SECONDS * 1000))
+  fi
+}
+
+# parse_step_profile PROFILE
+#   "net", "disk", "cpu" or a mix like "net:70,disk:20,cpu:10" (sums to 100).
+#   Sets PROFILE_NET, PROFILE_DISK and PROFILE_CPU (percent).
+parse_step_profile() {
+  local profile=$1 part kind weight total=0
+  local IFS=,
+
+  PROFILE_NET=0 PROFILE_DISK=0 PROFILE_CPU=0
+
+  for part in $profile; do
+    kind=${part%%:*}
+    weight=100
+    [[ $part == *:* ]] && weight=${part##*:}
+
+    [[ $weight =~ ^[0-9]+$ ]] || { echo "bad step time profile: '$profile'" >&2; exit 1; }
+
+    case $kind in
+      net)  PROFILE_NET=$weight ;;
+      disk) PROFILE_DISK=$weight ;;
+      cpu)  PROFILE_CPU=$weight ;;
+      *)    echo "bad step time profile: '$profile'" >&2; exit 1 ;;
+    esac
+
+    total=$((total + weight))
+  done
+
+  ((total == 100)) || { echo "step time profile must add up to 100: '$profile'" >&2; exit 1; }
+}
+
+# clamped_ratio ACTUAL_MS ESTIMATE_MS
+#   Set REPLY to the learned speed ratio in percent. The prior (worth
+#   RATIO_PRIOR_MS of "on estimate" evidence) stops the first short steps from
+#   swinging it wildly, and the clamp stops one stuck step from ruining the ETA.
+clamped_ratio() {
+  REPLY=$(( ($1 + RATIO_PRIOR_MS) * 100 / ($2 + RATIO_PRIOR_MS) ))
+
+  ((REPLY < RATIO_MIN_PERCENT)) && REPLY=$RATIO_MIN_PERCENT
+  ((REPLY > RATIO_MAX_PERCENT)) && REPLY=$RATIO_MAX_PERCENT
+}
+
+# scaled_estimate_ms STEP_INDEX
+#   Set REPLY to the step's estimate, stretched by the learned ratios of the kinds
+#   of work it does.
+scaled_estimate_ms() {
+  local i=$1 mix_percent
+
+  mix_percent=$(( STEP_WEIGHT_NET[i] * TIMING_RATIO_NET
+                + STEP_WEIGHT_DISK[i] * TIMING_RATIO_DISK
+                + STEP_WEIGHT_CPU[i] * TIMING_RATIO_CPU ))
+
+  REPLY=$((STEP_ESTIMATE_MS[i] * mix_percent / 10000))
+  ((REPLY < 1)) && REPLY=1
+}
+
+# record_finished_step STEP_INDEX ACTUAL_MS
+#   Split the step's real and estimated time across the three kinds by its profile
+#   and refresh the learned ratios.
+record_finished_step() {
+  local i=$1 actual_ms=$2
+
+  TIMING_ACTUAL_NET=$((TIMING_ACTUAL_NET + actual_ms * STEP_WEIGHT_NET[i] / 100))
+  TIMING_ACTUAL_DISK=$((TIMING_ACTUAL_DISK + actual_ms * STEP_WEIGHT_DISK[i] / 100))
+  TIMING_ACTUAL_CPU=$((TIMING_ACTUAL_CPU + actual_ms * STEP_WEIGHT_CPU[i] / 100))
+
+  TIMING_ESTIMATE_NET=$((TIMING_ESTIMATE_NET + STEP_ESTIMATE_MS[i] * STEP_WEIGHT_NET[i] / 100))
+  TIMING_ESTIMATE_DISK=$((TIMING_ESTIMATE_DISK + STEP_ESTIMATE_MS[i] * STEP_WEIGHT_DISK[i] / 100))
+  TIMING_ESTIMATE_CPU=$((TIMING_ESTIMATE_CPU + STEP_ESTIMATE_MS[i] * STEP_WEIGHT_CPU[i] / 100))
+
+  clamped_ratio "$TIMING_ACTUAL_NET" "$TIMING_ESTIMATE_NET";   TIMING_RATIO_NET=$REPLY
+  clamped_ratio "$TIMING_ACTUAL_DISK" "$TIMING_ESTIMATE_DISK"; TIMING_RATIO_DISK=$REPLY
+  clamped_ratio "$TIMING_ACTUAL_CPU" "$TIMING_ESTIMATE_CPU";   TIMING_RATIO_CPU=$REPLY
+}
+
+# print_timing_summary
+#   Measured speed per kind over the whole run, to help tune the estimates in STEPS.
+print_timing_summary() {
+  local summary="Speed vs estimate (100% = as estimated, higher = slower):"
+
+  ((TIMING_ESTIMATE_NET  > 0)) && summary+=" network $((TIMING_ACTUAL_NET * 100 / TIMING_ESTIMATE_NET))%"
+  ((TIMING_ESTIMATE_DISK > 0)) && summary+=" | disk $((TIMING_ACTUAL_DISK * 100 / TIMING_ESTIMATE_DISK))%"
+  ((TIMING_ESTIMATE_CPU  > 0)) && summary+=" | cpu $((TIMING_ACTUAL_CPU * 100 / TIMING_ESTIMATE_CPU))%"
+
+  echo "$summary"
+}
+
 # run_all_steps
-#   Run each step in the background and redraw a per-step progress bar (based on
-#   its estimate) plus an overall ETA until it finishes.
+#   Run each step in the background and redraw a per-step progress bar plus an
+#   overall ETA until it finishes. Both use the estimates rescaled by the speed
+#   ratios learned so far (see "Timing model" above).
 run_all_steps() {
   local total_steps=${#STEPS[@]}
-  local total_estimate_seconds=0
-  local finished_estimate_seconds=0
-  local run_start=$SECONDS
-  local step_number=0
-
-  local step_entry estimate_seconds description function_name
-  local step_pid step_start elapsed percent filled_width
-  local speed_ratio_percent eta_seconds exit_code
+  local step_number=0 step_index=0 later_index
+  local run_start_ms step_start_ms elapsed_ms
+  local step_entry estimate_seconds description function_name step_profile
+  local step_pid percent filled_width exit_code
+  local current_scaled_ms future_scaled_ms remaining_ms eta_seconds
   local overlap overlapped_function trigger_function
-  local -A early_pids=()   # step function -> PID of a step already running in parallel
+  local -A early_pids=()         # step function -> PID of a step already running in parallel
   local -A step_description=()   # step function -> description
 
   for step_entry in "${STEPS[@]}"; do
-    total_estimate_seconds=$((total_estimate_seconds + ${step_entry%%|*}))
-    IFS='|' read -r _ description function_name <<< "$step_entry"
+    IFS='|' read -r estimate_seconds description function_name step_profile <<< "$step_entry"
+    parse_step_profile "$step_profile"
+
+    STEP_ESTIMATE_MS[step_index]=$((estimate_seconds * 1000))
+    STEP_WEIGHT_NET[step_index]=$PROFILE_NET
+    STEP_WEIGHT_DISK[step_index]=$PROFILE_DISK
+    STEP_WEIGHT_CPU[step_index]=$PROFILE_CPU
     step_description[$function_name]=$description
+    step_index=$((step_index + 1))
   done
 
+  set_now_ms
+  run_start_ms=$NOW_MS
+
   for step_entry in "${STEPS[@]}"; do
-    IFS='|' read -r estimate_seconds description function_name <<< "$step_entry"
+    IFS='|' read -r estimate_seconds description function_name step_profile <<< "$step_entry"
+    step_index=$step_number          # 0-based position of this step in STEPS
     step_number=$((step_number + 1))
-    step_start=$SECONDS
+    set_now_ms
+    step_start_ms=$NOW_MS
 
     # Start any read-only steps that are meant to overlap with this one.
     for overlap in "${OVERLAPPED_STEPS[@]}"; do
@@ -1293,21 +1422,28 @@ run_all_steps() {
       step_pid=$!
     fi
 
-    while kill -0 "$step_pid" 2>/dev/null; do
-      elapsed=$((SECONDS - step_start))
+    # This step's estimate and everything still to come, at the speeds seen so far.
+    # The ratios only change when a step finishes, so this is computed once per step.
+    scaled_estimate_ms "$step_index"
+    current_scaled_ms=$REPLY
 
-      percent=$((elapsed * 100 / estimate_seconds))
+    future_scaled_ms=0
+    for ((later_index = step_index + 1; later_index < total_steps; later_index++)); do
+      scaled_estimate_ms "$later_index"
+      future_scaled_ms=$((future_scaled_ms + REPLY))
+    done
+
+    while kill -0 "$step_pid" 2>/dev/null; do
+      set_now_ms
+      elapsed_ms=$((NOW_MS - step_start_ms))
+
+      percent=$((elapsed_ms * 100 / current_scaled_ms))
       ((percent > 99)) && percent=99
       filled_width=$((percent * BAR_WIDTH / 100))
 
-      # How much slower/faster than estimated the finished steps ran (100 = on time).
-      speed_ratio_percent=100
-      if ((finished_estimate_seconds > 0)); then
-        speed_ratio_percent=$(( (SECONDS - run_start) * 100 / finished_estimate_seconds ))
-      fi
-
-      eta_seconds=$(( (total_estimate_seconds - finished_estimate_seconds) * speed_ratio_percent / 100 - elapsed ))
-      ((eta_seconds < 0)) && eta_seconds=0
+      remaining_ms=$((current_scaled_ms - elapsed_ms))
+      ((remaining_ms < 0)) && remaining_ms=0
+      eta_seconds=$(( (remaining_ms + future_scaled_ms + 999) / 1000 ))
 
       printf '\r\033[K[%d/%d] %s [%s%s] %d%% | overall ETA ~%ds' \
         "$step_number" "$total_steps" "$description" \
@@ -1319,16 +1455,21 @@ run_all_steps() {
 
     wait "$step_pid"
     exit_code=$?
-    finished_estimate_seconds=$((finished_estimate_seconds + estimate_seconds))
+
+    set_now_ms
+    elapsed_ms=$((NOW_MS - step_start_ms))
+    record_finished_step "$step_index" "$elapsed_ms"
 
     printf '\r\033[K[%d/%d] %s [%s] done in %ds%s\n' \
       "$step_number" "$total_steps" "$description" "$BAR_FILLED" \
-      "$((SECONDS - step_start))" \
+      "$((elapsed_ms / 1000))" \
       "$([[ $exit_code -ne 0 ]] && echo " (rc=$exit_code, see $MAIN_LOG)")"
   done
 
+  set_now_ms
   echo
-  echo "Total time: $((SECONDS - run_start))s"
+  echo "Total time: $(((NOW_MS - run_start_ms) / 1000))s"
+  print_timing_summary
 }
 
 # report_results
