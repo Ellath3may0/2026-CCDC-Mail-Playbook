@@ -44,8 +44,6 @@ if [[ -z ${MEGASCRIPT_CLEAN_ENV:-} ]]; then
     TERM="${TERM:-xterm}" \
     LANG=C.UTF-8 \
     DEBIAN_FRONTEND=noninteractive \
-    NEEDRESTART_SUSPEND=1 \
-    APT_LISTCHANGES_FRONTEND=none \
     /bin/bash --noprofile --norc "$(readlink -f "$0")" "$@"
 fi
 
@@ -54,32 +52,13 @@ unalias -a 2>/dev/null
 hash -r
 umask 077
 
-# Never let a shell idle timeout apply to this run.
-unset TMOUT
-
 # Disable Ctrl-S/Ctrl-Q flow control so an accidental Ctrl-S cannot freeze the
 # output (and therefore the script). Terminal settings are restored on exit.
 ORIGINAL_TTY_SETTINGS=$(stty -g 2>/dev/null)
 stty -ixon 2>/dev/null
+trap '[[ -n $ORIGINAL_TTY_SETTINGS ]] && stty "$ORIGINAL_TTY_SETTINGS" 2>/dev/null' EXIT
 
 SCRIPT_PID=$$
-
-# Keepalive: every 15s write an invisible escape sequence to the terminal so
-# NAT, firewall and client idle timers never see a quiet connection. It stops
-# by itself when this script exits.
-KEEPALIVE_PID=
-if [[ -w ${INVOKING_TTY:-} ]]; then
-  (
-    while kill -0 "$SCRIPT_PID" 2>/dev/null; do
-      sleep 15
-      printf '\033[0m' > "$INVOKING_TTY" 2>/dev/null
-    done
-  ) &
-  KEEPALIVE_PID=$!
-fi
-
-trap '[[ -n $KEEPALIVE_PID ]] && kill "$KEEPALIVE_PID" 2>/dev/null
-      [[ -n $ORIGINAL_TTY_SETTINGS ]] && stty "$ORIGINAL_TTY_SETTINGS" 2>/dev/null' EXIT
 
 # Private working directory on tmpfs (cleared on reboot). Holds logs and state.
 WORK_DIR=/run/megascript
@@ -99,12 +78,17 @@ UPGRADE_STATUS_FILE="$WORK_DIR/upgrade_status"
 PURGE_LIST_FILE="$WORK_DIR/purge.list"
 OWNED_PATHS_INDEX="$WORK_DIR/owned_paths.index"
 
+readonly WORK_DIR MAIN_LOG WARNINGS_FILE PREFLIGHT_FINDINGS_FILE NFTBUILD_FETCH_STATUS_FILE
+readonly UPGRADE_LOG UPGRADE_PID_FILE UPGRADE_STATUS_FILE FINAL_REPORT_FILE PURGE_LIST_FILE OWNED_PATHS_INDEX
+
 : > "$MAIN_LOG"
 : > "$WARNINGS_FILE"
 
 # Options for every apt-get call: non-interactive, wait up to 30 min for the
 # dpkg lock (the background upgrade holds it), keep existing config files.
-APT_OPTIONS=(-y -o DPkg::Lock::Timeout=1800 -o Dpkg::Options::=--force-confold)
+APT_OPTIONS=(-y -o DPkg::Lock::Timeout=1800 -o Dpkg::Options::=--force-confold
+             -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+readonly -a APT_OPTIONS
 
 # PIDs of this script and its parents, so checks never kill our own session.
 ANCESTOR_PIDS=" $$ "
@@ -115,7 +99,7 @@ ANCESTOR_PIDS=" $$ "
 # add_warning MESSAGE
 #   Queue a message for the "Attention" section of the final report.
 add_warning() {
-  echo "$*" >> "$WARNINGS_FILE"
+  printf '%s\n' "$*" >> "$WARNINGS_FILE"
 }
 
 # build_owned_path_index
@@ -123,21 +107,18 @@ add_warning() {
 #   merged-/usr prefix stripped (/usr/lib/x and /lib/x both become /lib/x). This
 #   avoids dpkg -S false negatives on usr-merged systems and is much faster.
 build_owned_path_index() {
-  cat /var/lib/dpkg/info/*.list 2>/dev/null \
-    | sed 's#^/usr/#/#' \
-    | sort -u > "$OWNED_PATHS_INDEX"
+  sed 's#^/usr/#/#' /var/lib/dpkg/info/*.list 2>/dev/null \
+    | sort -u > "$OWNED_PATHS_INDEX.tmp"
+
+  # Atomic replace: steps running in parallel never see a half-written index.
+  mv -f "$OWNED_PATHS_INDEX.tmp" "$OWNED_PATHS_INDEX"
 }
 
 # is_package_owned PATH
 #   True if an installed package ships PATH (symlinks resolved, /usr merged).
-#   An empty or unresolvable path counts as NOT owned.
 is_package_owned() {
   local resolved_path
-
-  [[ -n $1 ]] || return 1
-
   resolved_path=$(readlink -f "$1")
-  [[ -n $resolved_path ]] || return 1
 
   [[ $resolved_path == /usr/* ]] && resolved_path=${resolved_path#/usr}
 
@@ -153,10 +134,38 @@ installed_packages_matching() {
     | awk -v name_regex="$name_regex" '$1=="ii" && $2 ~ name_regex {print $2}'
 }
 
+# verify_modified_files PACKAGE...
+#   Print the non-config files of PACKAGE... that differ from what dpkg
+#   installed (changed content, mode, owner or missing). Missing documentation,
+#   man pages and locales are ignored: minimal images strip them on purpose.
+#   Needs at least one package: `dpkg --verify` with no arguments would verify
+#   the whole system.
+verify_modified_files() {
+  (($# > 0)) || return 0
+
+  dpkg --verify "$@" 2>/dev/null \
+    | grep -v ' c /' \
+    | grep -Ev '^missing +/usr/share/(doc|man|info|locale|lintian)/'
+}
+
 # package_failed_verification PACKAGE
 #   True if any non-config file of PACKAGE differs from what dpkg installed.
 package_failed_verification() {
-  dpkg --verify "$1" 2>/dev/null | grep -qv ' c /'
+  verify_modified_files "$1" | grep -q .
+}
+export -f verify_modified_files package_failed_verification   # needed by the parallel workers below
+
+# find_tampered_packages PACKAGE...
+#   Verify packages in parallel (one worker per CPU, read-only) and print the
+#   names of those that fail verification, one per line, sorted.
+find_tampered_packages() {
+  (($# > 0)) || return 0
+
+  # shellcheck disable=SC2016  # the single-quoted script is meant for the child shell
+  printf '%s\0' "$@" \
+    | xargs -0 -n1 -P "$(nproc)" \
+        bash -c 'package_failed_verification "$1" && printf "%s\n" "$1"; exit 0' _ \
+    | sort
 }
 
 # quiesce_background_apt_jobs
@@ -179,7 +188,7 @@ quiesce_background_apt_jobs
 # add_preflight_finding MESSAGE
 #   Record a keylogger-check finding (also shown in the final report).
 add_preflight_finding() {
-  echo "$*" >> "$PREFLIGHT_FINDINGS_FILE"
+  printf '%s\n' "$*" >> "$PREFLIGHT_FINDINGS_FILE"
   add_warning "PREFLIGHT: $*"
 }
 
@@ -196,51 +205,49 @@ collect_ancestor_pids() {
 
 # preflight_check_preload_hooks
 #   Remove /etc/ld.so.preload and flag processes started with LD_PRELOAD.
+#   One grep over every environ file instead of several forks per process.
 preflight_check_preload_hooks() {
-  local proc_dir pid
+  local environ_file pid
 
   if [[ -s /etc/ld.so.preload ]]; then
     add_preflight_finding "/etc/ld.so.preload existed (removed): $(tr '\n' ' ' < /etc/ld.so.preload)"
   fi
   rm -f /etc/ld.so.preload
 
-  for proc_dir in /proc/[0-9]*; do
-    pid=${proc_dir#/proc/}
-    if tr '\0' '\n' < "$proc_dir/environ" 2>/dev/null | grep -q '^LD_PRELOAD='; then
-      add_preflight_finding "pid $pid ($(readlink "$proc_dir/exe")) has LD_PRELOAD set"
-    fi
-  done
+  while read -r environ_file; do
+    pid=${environ_file#/proc/}
+    pid=${pid%/environ}
+    add_preflight_finding "pid $pid ($(readlink "/proc/$pid/exe")) has LD_PRELOAD set"
+  done < <(grep -lzs '^LD_PRELOAD=' /proc/[0-9]*/environ 2>/dev/null)
 }
 
 # preflight_check_ptrace_taps
 #   Any process being ptraced (strace on sshd/sudo/login etc.) gets its tracer killed.
 preflight_check_ptrace_taps() {
-  local proc_dir pid tracer_pid
+  local status_line pid tracer_pid
 
-  for proc_dir in /proc/[0-9]*; do
-    pid=${proc_dir#/proc/}
-    tracer_pid=$(awk '/^TracerPid:/ {print $2}' "$proc_dir/status" 2>/dev/null)
+  # Lines look like: /proc/<pid>/status:TracerPid:<TAB><tracer pid>
+  while read -r status_line; do
+    pid=${status_line#/proc/}
+    pid=${pid%%/*}
+    tracer_pid=${status_line##*[[:space:]]}
 
-    [[ ${tracer_pid:-0} -gt 0 ]] || continue
     [[ $ANCESTOR_PIDS == *" $tracer_pid "* ]] && continue
 
-    add_preflight_finding "pid $pid ($(cat "$proc_dir/comm" 2>/dev/null)) is traced by pid $tracer_pid ($(readlink "/proc/$tracer_pid/exe")), killing tracer"
+    add_preflight_finding "pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null)) is traced by pid $tracer_pid ($(readlink "/proc/$tracer_pid/exe")), killing tracer"
     kill -9 "$tracer_pid"
-  done
+  done < <(grep -s '^TracerPid:[[:space:]]*[1-9]' /proc/[0-9]*/status 2>/dev/null)
 }
 
 # preflight_check_input_device_readers
 #   Processes holding /dev/input open can log keystrokes. Unpackaged ones are
 #   killed, packaged ones (logind, Xorg) are only reported.
 preflight_check_input_device_readers() {
-  local proc_dir pid exe_path
+  local pid exe_path
 
-  for proc_dir in /proc/[0-9]*; do
-    pid=${proc_dir#/proc/}
-
-    readlink "$proc_dir"/fd/* 2>/dev/null | grep -q '^/dev/input/' || continue
-
-    exe_path=$(readlink "$proc_dir/exe" 2>/dev/null)
+  # One find over every fd directory, reduced to a unique list of PIDs.
+  while read -r pid; do
+    exe_path=$(readlink "/proc/$pid/exe" 2>/dev/null)
 
     if [[ $exe_path != *'(deleted)' ]] && is_package_owned "$exe_path"; then
       add_preflight_finding "packaged process reads /dev/input, review: pid $pid ($exe_path)"
@@ -248,7 +255,7 @@ preflight_check_input_device_readers() {
       add_preflight_finding "unpackaged process reads /dev/input, killing: pid $pid ($exe_path)"
       kill -9 "$pid"
     fi
-  done
+  done < <(find /proc/[0-9]*/fd -maxdepth 1 -lname '/dev/input/*' 2>/dev/null | cut -d/ -f3 | sort -u)
 }
 
 # preflight_check_tty_sniffers
@@ -273,18 +280,15 @@ preflight_check_tty_sniffers() {
 #   that are missing or not owned by any package.
 preflight_check_pam_and_login_binaries() {
   local auth_package_regex='^(libpam-modules|libpam-modules-bin|libpam-runtime|libpam0g|libpam-krb5|libpam-sss|sudo|login|passwd|openssh-server)$'
-  local tampered_packages=()
+  local auth_packages=() tampered_packages=()
   local package module_name module_path module_file
 
-  for package in $(installed_packages_matching "$auth_package_regex"); do
-    if package_failed_verification "$package"; then
-      tampered_packages+=("$package")
-    fi
-  done
+  mapfile -t auth_packages < <(installed_packages_matching "$auth_package_regex")
+  mapfile -t tampered_packages < <(find_tampered_packages "${auth_packages[@]}")
 
   if ((${#tampered_packages[@]} > 0)); then
     add_preflight_finding "tampered auth packages, reinstalling: ${tampered_packages[*]}"
-    apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}" >> "$MAIN_LOG" 2>&1 < /dev/null
+    apt-get "${APT_OPTIONS[@]}" --reinstall install "${tampered_packages[@]}" >> "$MAIN_LOG" 2>&1
 
     for package in "${tampered_packages[@]}"; do
       if package_failed_verification "$package"; then
@@ -294,15 +298,14 @@ preflight_check_pam_and_login_binaries() {
   fi
 
   # Every .so named in /etc/pam.d must exist and belong to a package.
-  cat /etc/pam.d/* 2>/dev/null \
-    | grep -v '^\s*#' \
+  grep -hsv '^\s*#' /etc/pam.d/* \
     | grep -Eo '[A-Za-z0-9_./-]+\.so' \
     | sort -u \
     | while read -r module_name; do
         if [[ $module_name == /* ]]; then
           module_path=$module_name
         else
-          module_path=$(find -H /usr/lib /lib -maxdepth 3 -path "*/security/$module_name" -print -quit 2>/dev/null)
+          module_path=$(find /usr/lib/*/security /usr/lib/security /lib/security -maxdepth 1 -name "$module_name" 2>/dev/null | head -1)
         fi
 
         if [[ -z $module_path || ! -e $module_path ]]; then
@@ -373,20 +376,31 @@ preflight_harden_input_and_tty() {
 #   abort before any password is typed.
 run_preflight() {
   local answer
+  local background_scan_pids=()
 
   : > "$PREFLIGHT_FINDINGS_FILE"
   collect_ancestor_pids
 
   echo "Pre-flight: keylogger checks (before any password is typed)"
 
+  # The two read-only scans touch nothing the other checks change, so they run
+  # in the background while the sequential checks proceed. Findings are appended
+  # to the findings file (single short writes, safe to interleave).
+  preflight_check_kernel_modules &
+  background_scan_pids+=($!)
+  preflight_check_ebpf_programs &
+  background_scan_pids+=($!)
+
   echo "  [1/8] preload hooks";                preflight_check_preload_hooks
   echo "  [2/8] ptrace/strace taps";           preflight_check_ptrace_taps
   echo "  [3/8] processes reading /dev/input"; preflight_check_input_device_readers
   echo "  [4/8] tty sniffers";                 preflight_check_tty_sniffers
   echo "  [5/8] PAM and login binaries";       preflight_check_pam_and_login_binaries
-  echo "  [6/8] kernel modules";               preflight_check_kernel_modules
-  echo "  [7/8] eBPF programs";                preflight_check_ebpf_programs
+  echo "  [6/8] kernel modules (parallel scan)"
+  echo "  [7/8] eBPF programs (parallel scan)"
   echo "  [8/8] input and tty hardening";      preflight_harden_input_and_tty
+
+  wait "${background_scan_pids[@]}"
 
   if [[ -s $PREFLIGHT_FINDINGS_FILE ]]; then
     echo
@@ -461,25 +475,15 @@ step_reset_shell_profiles() {
   local account home_dir
 
   # /etc/skel, /etc/profile and /etc/bash.bashrc come from these packages.
-  # Only the download gets a timeout: killing apt/dpkg mid-install would leave
-  # dpkg half-configured and break every later apt call. The install itself
-  # then needs no network, runs unattended and waits for the lock if needed.
-  dpkg --configure -a < /dev/null
-
-  if timeout -k 5 120 apt-get -y -d --reinstall \
-        -o Acquire::Retries=0 \
-        -o Acquire::http::Timeout=15 \
-        -o Acquire::https::Timeout=15 \
-        -o DPkg::Lock::Timeout=60 \
-        install bash base-files < /dev/null; then
-    apt-get -y --reinstall \
-        -o Dpkg::Options::=--force-confnew \
-        -o DPkg::Lock::Timeout=300 \
-        install bash base-files < /dev/null \
-      || add_warning "bash/base-files reinstall failed"
-  else
-    add_warning "could not download bash/base-files (lock held or mirror unreachable)"
-  fi
+  # Short timeouts so a held lock or unreachable mirror cannot stall the run.
+  timeout 300 apt-get -y --reinstall \
+      -o Dpkg::Options::=--force-confnew \
+      -o DPkg::Lock::Timeout=240 \
+      -o Acquire::Retries=0 \
+      -o Acquire::http::Timeout=15 \
+      -o Acquire::https::Timeout=15 \
+      install bash base-files \
+    || add_warning "could not reinstall bash/base-files defaults (lock held or mirror unreachable)"
 
   [[ -f /etc/skel/.bashrc ]] || add_warning "/etc/skel/.bashrc missing"
 
@@ -534,16 +538,12 @@ step_install_fish() {
   apt-get update || add_warning "apt update failed"
   apt-get "${APT_OPTIONS[@]}" install fish || add_warning "fish install failed"
 
-  fish_path=$(command -v fish) || return 0
+  fish_path=$(command -v fish)
   grep -qx "$fish_path" /etc/shells || echo "$fish_path" >> /etc/shells
 }
 
 step_set_root_shell_to_fish() {
-  local fish_path
-
-  fish_path=$(command -v fish) || { add_warning "fish missing, root shell unchanged"; return 1; }
-
-  chsh -s "$fish_path" root || add_warning "could not set root shell to fish"
+  chsh -s "$(command -v fish)" root || add_warning "could not set root shell to fish"
 }
 
 # Remove snap entirely. Any snap that looks like a scored or supporting service
@@ -552,7 +552,7 @@ step_remove_snap() {
   local scored_service_regex='postfix|dovecot|roundcube|ssh|krb5|kerberos|sssd|php|apache|nginx|mysql|mariadb|postgres'
   local keep_snapd=0
   local migrated_services=()
-  local snap_name pass_number
+  local snap_name application_snaps
 
   if command -v snap > /dev/null; then
 
@@ -571,17 +571,20 @@ step_remove_snap() {
     ((keep_snapd)) && return 1
 
     # Remove applications first (a few passes for dependency order).
-    for pass_number in 1 2 3; do
-      for snap_name in $(snap list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Ev '^(snapd|core[0-9]*|bare)$'); do
-        timeout 120 snap remove --purge "$snap_name"
+    for _ in 1 2 3; do
+      application_snaps=$(snap list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Ev '^(snapd|core[0-9]*|bare)$')
+      [[ -z $application_snaps ]] && break
+
+      for snap_name in $application_snaps; do
+        snap remove --purge "$snap_name"
       done
     done
 
     # Then bases (core*, bare, gnome-*), then snapd itself.
     for snap_name in $(snap list 2>/dev/null | awk 'NR>1 {print $1}' | grep -v '^snapd$'); do
-      timeout 120 snap remove --purge "$snap_name"
+      snap remove --purge "$snap_name"
     done
-    timeout 120 snap remove --purge snapd
+    snap remove --purge snapd
   fi
 
   systemctl disable --now snapd.service snapd.socket snapd.seeded.service 2>/dev/null
@@ -609,13 +612,13 @@ step_remove_snap() {
 
 # Start `apt upgrade` detached in the background, security-relevant packages
 # (kernel, PHP, mail stack, auth libraries) first. After the upgrade it purges
-# the remote-access packages from PURGE_LIST_FILE. This runs AFTER the integrity,
-# bootloader, permission and temp-file steps so none of them race with dpkg.
+# the remote-access packages from PURGE_LIST_FILE.
 step_start_background_upgrade() {
   cat > "$WORK_DIR/upgrade.sh" <<'UPGRADE_SCRIPT_EOF'
 echo $$ > "$WORK_DIR/upgrade.pid"
 
-APT_OPTIONS=(-y -o DPkg::Lock::Timeout=1800 -o Dpkg::Options::=--force-confold)
+APT_OPTIONS=(-y -o DPkg::Lock::Timeout=1800 -o Dpkg::Options::=--force-confold
+             -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
 
 priority_regex='^(linux-(image|modules|headers)|php|postfix|dovecot|openssh|openssl|libssl|krb5|libkrb5|sssd|libpam|libc6|sudo|systemd|apache2|nginx|roundcube|libldap|libsasl2)'
 priority_packages=$(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' \
@@ -652,14 +655,8 @@ UPGRADE_SCRIPT_EOF
 
 # Wait for the parallel nftbuild download, install it and run it.
 step_run_nftbuild() {
-  local waited=0
-
   while [[ ! -f $NFTBUILD_FETCH_STATUS_FILE ]]; do
     sleep 1
-    if ((++waited > 200)); then
-      add_warning "nftbuild download timed out"
-      return 1
-    fi
   done
 
   if [[ $(cat "$NFTBUILD_FETCH_STATUS_FILE") != 0 ]]; then
@@ -694,26 +691,22 @@ step_disable_remote_access_tools() {
 # Verify bootloader and kernel packages, reinstall on tampering, strip dangerous
 # kernel parameters, regenerate grub config and initramfs, warn if unfixable.
 step_check_bootloader() {
-  local boot_packages tampered_files
+  local boot_packages=()
+  local modified_files script_path
+  local reinstalled=0
 
-  boot_packages=$(installed_packages_matching '^(grub|shim|linux-image|linux-modules)')
+  mapfile -t boot_packages < <(installed_packages_matching '^(grub|shim|linux-image|linux-modules)')
 
-  # With no package names dpkg --verify would check the whole system.
-  [[ -n $boot_packages ]] || { add_warning "no bootloader/kernel packages found"; return 1; }
+  modified_files=$(verify_modified_files "${boot_packages[@]}")
 
-  list_tampered_boot_files() {
-    dpkg --verify "$boot_packages" 2>/dev/null | grep -v ' c /'
-  }
-
-  if [[ -n $(list_tampered_boot_files) ]]; then
+  if [[ -n $modified_files ]]; then
     add_warning "bootloader/kernel files failed verification, reinstalling"
-    apt-get "${APT_OPTIONS[@]}" --reinstall install "$boot_packages"
+    apt-get "${APT_OPTIONS[@]}" --reinstall install "${boot_packages[@]}"
+    reinstalled=1
   fi
 
-  # Remove kernel parameters that give a shell or swap init (including drop-ins
-  # such as /etc/default/grub.d/50-cloudimg-settings.cfg).
-  sed -i -E 's/ ?(init=[^" ]*|rd\.break[^" ]*|systemd\.unit=[^" ]*|single)//g' \
-    /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null
+  # Remove kernel parameters that give a shell or swap init.
+  sed -i -E 's/ ?(init=[^" ]*|rd\.break[^" ]*|systemd\.unit=[^" ]*|single)//g' /etc/default/grub
 
   grep -rEl 'init=/|rd\.break' /etc/grub.d 2>/dev/null | while read -r script_path; do
     add_warning "suspicious grub.d script: $script_path"
@@ -727,18 +720,24 @@ step_check_bootloader() {
     add_warning "grub.cfg still has suspicious kernel params"
   fi
 
-  tampered_files=$(list_tampered_boot_files)
-  if [[ -n $tampered_files ]]; then
-    add_warning "UNFIXABLE bootloader tampering, inspect manually: $(echo "$tampered_files" | head -5 | tr '\n' ';')"
+  # Only re-verify if we reinstalled; otherwise the first (clean) result stands.
+  if ((reinstalled)); then
+    modified_files=$(verify_modified_files "${boot_packages[@]}")
+
+    if [[ -n $modified_files ]]; then
+      add_warning "UNFIXABLE bootloader tampering, inspect manually: $(head -5 <<< "$modified_files" | tr '\n' ';')"
+    fi
   fi
 }
 
 # Least-privilege ownership and modes across /etc, /root, homes and the filesystem.
 # authorized_keys files are deliberately never touched (another tool manages them).
 step_fix_permissions() {
-  local home_dir home_user suid_file
+  local home_dir home_user entry_type entry_mode entry_path entry_mode_bits
 
-  shopt -s nullglob   # an empty /home must not yield a literal "/home/*"
+  # Packages installed since startup (snap migration, upgrade) must count as owned,
+  # otherwise their legitimate setuid files would be stripped below.
+  build_owned_path_index
 
   # --- Top-level directories ---
   chown root:root / /etc /root
@@ -784,8 +783,6 @@ step_fix_permissions() {
   chmod 644 /etc/crontab
 
   # --- home directories: owned by their user, private ---
-  # A home whose user cannot be resolved (for example the AD server is
-  # unreachable) is left alone: chowning it to root would break mail access.
   for home_dir in /home/*/; do
     home_dir=${home_dir%/}
     home_user=${home_dir##*/}
@@ -793,38 +790,51 @@ step_fix_permissions() {
     if id "$home_user" &>/dev/null; then
       find "$home_dir" ! -name 'authorized_keys*' -exec chown -h "$home_user:$(id -gn "$home_user")" {} +
     else
-      add_warning "home without resolvable user (left untouched): $home_dir"
-      continue
+      find "$home_dir" ! -name 'authorized_keys*' -exec chown -h root:root {} +
+      add_warning "home without user: $home_dir"
     fi
 
     chmod 700 "$home_dir"
   done
 
-  # --- Whole filesystem: no world-writable files, no unsticky world-writable dirs ---
-  find / -xdev -type f ! -name 'authorized_keys*' -perm -0002 -exec chmod o-w {} + 2>/dev/null
-  find / -xdev -type d -perm -0002 ! -perm -1000 -exec chmod o-w {} + 2>/dev/null
+  # --- Whole filesystem, ONE find pass for all three checks ---
+  #   * world-writable files lose o+w
+  #   * world-writable directories without the sticky bit lose o+w
+  #   * setuid/setgid files that no package owns lose those bits
+  # find prints "<type> <octal mode> <path>" NUL-terminated for each candidate.
+  while IFS=$'\t' read -r -d '' entry_type entry_mode entry_path; do
+    entry_mode_bits=$((8#$entry_mode))
 
-  # --- setuid/setgid files that no package owns lose those bits ---
-  find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | while read -r suid_file; do
-    if ! is_package_owned "$suid_file"; then
-      chmod ug-s "$suid_file"
-      add_warning "stripped suid/sgid from unpackaged file: $suid_file"
+    if [[ $entry_type == d ]]; then
+      chmod o-w "$entry_path"
+      continue
     fi
-  done
+
+    if ((entry_mode_bits & 0002)) && [[ ${entry_path##*/} != authorized_keys* ]]; then
+      chmod o-w "$entry_path"
+    fi
+
+    if ((entry_mode_bits & 06000)) && ! is_package_owned "$entry_path"; then
+      chmod ug-s "$entry_path"
+      add_warning "stripped suid/sgid from unpackaged file: $entry_path"
+    fi
+  done < <(
+    find / -xdev \( \
+        \( -type f \( -perm -0002 -o -perm -4000 -o -perm -2000 \) \) \
+        -o \( -type d -perm -0002 ! -perm -1000 \) \
+      \) -printf '%y\t%m\t%p\0' 2>/dev/null
+  )
 }
 
 # Verify key binaries (ssh, sudo, PAM, mail stack, libc, apt, ...) against dpkg
 # checksums and reinstall any that were modified.
 step_check_binary_integrity() {
   local critical_package_regex='^(openssh-server|openssh-client|openssh-sftp-server|sudo|login|passwd|util-linux|coreutils|bash|libc6|apt|dpkg|libpam-modules|libpam-modules-bin|libpam-runtime|libpam0g|libpam-krb5|libpam-sss|libnss-sss|krb5-user|libkrb5-3|sssd|sssd-common|postfix|postfix-ldap|dovecot-core|dovecot-imapd|dovecot-pop3d|dovecot-ldap|systemd|openssl)$'
-  local tampered_packages=()
+  local critical_packages=() tampered_packages=()
   local package changed_files
 
-  for package in $(installed_packages_matching "$critical_package_regex"); do
-    if package_failed_verification "$package"; then
-      tampered_packages+=("$package")
-    fi
-  done
+  mapfile -t critical_packages < <(installed_packages_matching "$critical_package_regex")
+  mapfile -t tampered_packages < <(find_tampered_packages "${critical_packages[@]}")
 
   ((${#tampered_packages[@]} == 0)) && return 0
 
@@ -833,7 +843,7 @@ step_check_binary_integrity() {
 
   for package in "${tampered_packages[@]}"; do
     if package_failed_verification "$package"; then
-      changed_files=$(dpkg --verify "$package" | grep -v ' c /' | awk '{print $NF}' | head -3 | tr '\n' ' ')
+      changed_files=$(verify_modified_files "$package" | awk '{print $NF}' | head -3 | tr '\n' ' ')
       add_warning "STILL TAMPERED after reinstall: $package ($changed_files)"
     fi
   done
@@ -948,37 +958,32 @@ step_check_mail_and_php() {
     | while read -r php_file; do
         add_warning "phpinfo() found: $php_file"
       done
-
-  return 0
 }
 
-# Delete temporary files. systemd-private-* dirs are kept because running
-# services (PrivateTmp=) depend on them, tmux-* so you can reattach to tmux.
+# Delete temporary files. Kept: systemd-private-* (running services use them as
+# PrivateTmp=) and the scratch dirs of in-flight initramfs/dpkg/apt runs, which the
+# background upgrade may be using right now.
 step_remove_temp_files() {
   find /tmp /var/tmp -xdev -mindepth 1 -maxdepth 1 \
-       ! -name 'systemd-private-*' ! -name 'tmux-*' -exec rm -rf {} + 2>/dev/null
+    ! -name 'systemd-private-*' ! -name 'mkinitramfs*' ! -name 'dpkg*' ! -name 'apt*' ! -name 'needrestart*' \
+    -exec rm -rf {} + 2>/dev/null
 
   rm -rf /dev/shm/* /var/crash/* /root/.cache 2>/dev/null
-  return 0
 }
 
 # Kill processes running from memory only (deleted binary or memfd). Package
 # binaries replaced by the upgrade are NOT killed (that would take down sshd and
 # friends), they are listed as "restart needed" instead.
 step_stop_memory_only_processes() {
-  local proc_dir pid exe_path binary_path
+  local exe_link pid exe_path binary_path
 
-  for proc_dir in /proc/[0-9]*; do
-    pid=${proc_dir#/proc/}
+  # One find lists only the /proc/<pid>/exe links that point at deleted/memfd files.
+  while read -r exe_link; do
+    pid=${exe_link#/proc/}
+    pid=${pid%/exe}
     [[ $pid == "$SCRIPT_PID" ]] && continue
 
-    exe_path=$(readlink "$proc_dir/exe" 2>/dev/null) || continue
-
-    case $exe_path in
-      *' (deleted)' | /memfd:*) ;;
-      *) continue ;;
-    esac
-
+    exe_path=$(readlink "$exe_link" 2>/dev/null) || continue
     binary_path=${exe_path% (deleted)}
 
     if [[ $exe_path != /memfd:* ]] && is_package_owned "$binary_path"; then
@@ -987,7 +992,7 @@ step_stop_memory_only_processes() {
     fi
 
     kill -9 "$pid" && add_warning "killed memory-only process $pid ($exe_path)"
-  done
+  done < <(find /proc/[0-9]*/exe -maxdepth 0 \( -lname '* (deleted)' -o -lname '/memfd:*' \) 2>/dev/null)
 }
 
 step_reload_systemd() {
@@ -999,32 +1004,68 @@ step_reload_systemd() {
 # 4. STEP TABLE
 # =============================================================================
 # Format: "estimated seconds|description|function"
-# Estimates drive the progress bar and ETA, and are rescaled by how fast the
-# earlier steps actually ran.
+# Estimates are tuned for a 2 vCPU / 4 GB VM. They drive the progress bar and ETA,
+# and are rescaled by how fast the earlier steps actually ran.
 #
-# Order matters: the background upgrade starts only after every step that
-# verifies or rewrites packaged files, so none of them race with dpkg.
+# PARALLELISM. A step listed in OVERLAPPED_STEPS is started the moment its
+# "trigger" step starts, and its own row below only waits for it (so its estimate
+# is the expected *remaining* wait, usually tiny). Only steps that cannot interfere
+# with each other are overlapped:
+#
+#   Group 1 (nothing running yet, no apt activity):
+#     kill sessions | disable remote tools | binary integrity | sysctl
+#     Integrity must finish before any apt step starts, otherwise dpkg --verify
+#     could see a half-installed package and report false tampering.
+#
+#   Group 2 (apt chain: profiles -> fish -> root shell -> snap):
+#     runs alongside the bootloader check (grub, initramfs, no apt unless tampered).
+#     The background upgrade is only started AFTER the bootloader step, so it can
+#     never run update-initramfs at the same time as ours.
+#
+#   Group 3 (after nftbuild, which is third-party and runs alone):
+#     permissions | mail/PHP audit (read-only) | temp cleanup | memory-only processes
+#
+# Never overlapped: the apt steps with each other (they share one dpkg lock anyway),
+# nftbuild (unknown side effects), and daemon-reload (must see every change).
 
-STEPS=(
-  "25|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
-  "3|Change user and root passwords|step_change_passwords"
+readonly -a STEPS=(
+  "2|Change user and root passwords|step_change_passwords"
+
   "2|Kill other shell sessions|step_kill_other_sessions"
-  "60|apt update and install fish|step_install_fish"
+  "1|Disable unscored remote access tools (parallel)|step_disable_remote_access_tools"
+  "8|Binary integrity check (parallel)|step_check_binary_integrity"
+  "1|Apply sysctl hardening (parallel)|step_apply_sysctl_hardening"
+
+  "20|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
+  "45|apt update and install fish|step_install_fish"
   "1|Set root shell to fish|step_set_root_shell_to_fish"
-  "60|Migrate scored snaps, remove snap|step_remove_snap"
-  "20|Run nftbuild|step_run_nftbuild"
-  "15|Disable unscored remote access tools|step_disable_remote_access_tools"
-  "40|Check and fix bootloader|step_check_bootloader"
-  "40|Fix permissions and ownership|step_fix_permissions"
-  "60|Binary integrity check|step_check_binary_integrity"
-  "3|Apply sysctl hardening|step_apply_sysctl_hardening"
-  "3|Remove temp files|step_remove_temp_files"
-  "3|Start background apt upgrade|step_start_background_upgrade"
-  "5|Mail and PHP read-only checks|step_check_mail_and_php"
-  "3|Stop memory-only processes|step_stop_memory_only_processes"
-  "2|Daemon reload|step_reload_systemd"
+  "90|Migrate scored snaps, remove snap|step_remove_snap"
+  "5|Check and fix bootloader (parallel)|step_check_bootloader"
+  "2|Start background apt upgrade|step_start_background_upgrade"
+
+  "15|Run nftbuild|step_run_nftbuild"
+
+  "45|Fix permissions and ownership|step_fix_permissions"
+  "2|Mail and PHP read-only checks (parallel)|step_check_mail_and_php"
+  "1|Remove temp files (parallel)|step_remove_temp_files"
+  "1|Stop memory-only processes (parallel)|step_stop_memory_only_processes"
+
+  "3|Daemon reload|step_reload_systemd"
 )
 
+# Steps to launch early. Format: "step to start early:step that triggers it".
+# The trigger step must come BEFORE the overlapped step in STEPS.
+readonly -a OVERLAPPED_STEPS=(
+  "step_disable_remote_access_tools:step_kill_other_sessions"
+  "step_check_binary_integrity:step_kill_other_sessions"
+  "step_apply_sysctl_hardening:step_kill_other_sessions"
+
+  "step_check_bootloader:step_reset_shell_profiles"
+
+  "step_check_mail_and_php:step_fix_permissions"
+  "step_remove_temp_files:step_fix_permissions"
+  "step_stop_memory_only_processes:step_fix_permissions"
+)
 
 # =============================================================================
 # 5. RUNNER AND FINAL REPORT
@@ -1033,6 +1074,7 @@ STEPS=(
 BAR_FILLED='##############################'
 BAR_EMPTY='..............................'
 BAR_WIDTH=30
+readonly BAR_FILLED BAR_EMPTY BAR_WIDTH
 
 # run_all_steps
 #   Run each step in the background and redraw a per-step progress bar (based on
@@ -1047,6 +1089,8 @@ run_all_steps() {
   local step_entry estimate_seconds description function_name
   local step_pid step_start elapsed percent filled_width
   local speed_ratio_percent eta_seconds exit_code
+  local overlap overlapped_function trigger_function
+  local -A early_pids=()   # step function -> PID of a step already running in parallel
 
   for step_entry in "${STEPS[@]}"; do
     total_estimate_seconds=$((total_estimate_seconds + ${step_entry%%|*}))
@@ -1057,8 +1101,23 @@ run_all_steps() {
     step_number=$((step_number + 1))
     step_start=$SECONDS
 
-    "$function_name" >> "$MAIN_LOG" 2>&1 < /dev/null &
-    step_pid=$!
+    # Start any read-only steps that are meant to overlap with this one.
+    for overlap in "${OVERLAPPED_STEPS[@]}"; do
+      overlapped_function=${overlap%%:*}
+      trigger_function=${overlap##*:}
+
+      if [[ $trigger_function == "$function_name" ]]; then
+        "$overlapped_function" >> "$MAIN_LOG" 2>&1 &
+        early_pids[$overlapped_function]=$!
+      fi
+    done
+
+    if [[ -n ${early_pids[$function_name]:-} ]]; then
+      step_pid=${early_pids[$function_name]}   # already running, only wait for it
+    else
+      "$function_name" >> "$MAIN_LOG" 2>&1 &
+      step_pid=$!
+    fi
 
     while kill -0 "$step_pid" 2>/dev/null; do
       elapsed=$((SECONDS - step_start))
