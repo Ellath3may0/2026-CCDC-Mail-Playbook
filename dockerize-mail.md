@@ -8,7 +8,6 @@ sh ./get-docker.sh
 rm get-docker.sh
 ```
 
-
 ## Move mail configuration files and other things
 
 ```bash
