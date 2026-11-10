@@ -20,6 +20,12 @@
 # 1. BOOTSTRAP
 # =============================================================================
 
+# Survive a dropped or frozen terminal (ssh disconnect, nftbuild restarting ssh,
+# closed window, Ctrl-Z, background tty writes). Signals ignored here stay
+# ignored across the exec below and are inherited by every child process.
+# Ctrl-C is deliberately left working so you can still abort.
+trap '' HUP PIPE TSTP TTIN TTOU
+
 # Require sudo, then re-run this script inside an empty environment so no
 # aliases, functions, bash profile, BASH_ENV, LD_PRELOAD or other inherited
 # variables can interfere. Only the values passed to `env -i` below survive.
@@ -46,6 +52,12 @@ unalias -a 2>/dev/null
 hash -r
 umask 077
 
+# Disable Ctrl-S/Ctrl-Q flow control so an accidental Ctrl-S cannot freeze the
+# output (and therefore the script). Terminal settings are restored on exit.
+ORIGINAL_TTY_SETTINGS=$(stty -g 2>/dev/null)
+stty -ixon 2>/dev/null
+trap '[[ -n $ORIGINAL_TTY_SETTINGS ]] && stty "$ORIGINAL_TTY_SETTINGS" 2>/dev/null' EXIT
+
 SCRIPT_PID=$$
 
 # Private working directory on tmpfs (cleared on reboot). Holds logs and state.
@@ -60,9 +72,11 @@ WARNINGS_FILE="$WORK_DIR/warnings.log"                 # shown in the final repo
 PREFLIGHT_FINDINGS_FILE="$WORK_DIR/preflight.log"      # keylogger check findings
 NFTBUILD_FETCH_STATUS_FILE="$WORK_DIR/nftbuild_fetch.rc"
 UPGRADE_LOG="$WORK_DIR/upgrade.log"
+FINAL_REPORT_FILE="$WORK_DIR/final_report.txt"
 UPGRADE_PID_FILE="$WORK_DIR/upgrade.pid"
 UPGRADE_STATUS_FILE="$WORK_DIR/upgrade_status"
 PURGE_LIST_FILE="$WORK_DIR/purge.list"
+OWNED_PATHS_INDEX="$WORK_DIR/owned_paths.index"
 
 : > "$MAIN_LOG"
 : > "$WARNINGS_FILE"
@@ -83,10 +97,25 @@ add_warning() {
   echo "$*" >> "$WARNINGS_FILE"
 }
 
+# build_owned_path_index
+#   Write every path any installed package ships to OWNED_PATHS_INDEX, with the
+#   merged-/usr prefix stripped (/usr/lib/x and /lib/x both become /lib/x). This
+#   avoids dpkg -S false negatives on usr-merged systems and is much faster.
+build_owned_path_index() {
+  cat /var/lib/dpkg/info/*.list 2>/dev/null \
+    | sed 's#^/usr/#/#' \
+    | sort -u > "$OWNED_PATHS_INDEX"
+}
+
 # is_package_owned PATH
-#   True if a dpkg package owns PATH (symlinks resolved first).
+#   True if an installed package ships PATH (symlinks resolved, /usr merged).
 is_package_owned() {
-  dpkg -S "$(readlink -f "$1")" &>/dev/null
+  local resolved_path
+  resolved_path=$(readlink -f "$1")
+
+  [[ $resolved_path == /usr/* ]] && resolved_path=${resolved_path#/usr}
+
+  grep -Fxq -- "$resolved_path" "$OWNED_PATHS_INDEX"
 }
 
 # installed_packages_matching REGEX
@@ -103,6 +132,18 @@ installed_packages_matching() {
 package_failed_verification() {
   dpkg --verify "$1" 2>/dev/null | grep -qv ' c /'
 }
+
+# quiesce_background_apt_jobs
+#   Stop Ubuntu's own apt timers and unattended-upgrades, which often hold the
+#   dpkg lock at boot and would stall every apt call in this script.
+quiesce_background_apt_jobs() {
+  systemctl stop apt-daily.timer apt-daily-upgrade.timer \
+                 apt-daily.service apt-daily-upgrade.service \
+                 unattended-upgrades.service 2>/dev/null
+}
+
+build_owned_path_index
+quiesce_background_apt_jobs
 
 
 # =============================================================================
@@ -394,8 +435,15 @@ step_reset_shell_profiles() {
   local account home_dir
 
   # /etc/skel, /etc/profile and /etc/bash.bashrc come from these packages.
-  apt-get "${APT_OPTIONS[@]}" --reinstall -o Dpkg::Options::=--force-confnew install bash base-files \
-    || add_warning "could not reinstall bash/base-files defaults"
+  # Short timeouts so a held lock or unreachable mirror cannot stall the run.
+  timeout 180 apt-get -y --reinstall \
+      -o Dpkg::Options::=--force-confnew \
+      -o DPkg::Lock::Timeout=60 \
+      -o Acquire::Retries=0 \
+      -o Acquire::http::Timeout=15 \
+      -o Acquire::https::Timeout=15 \
+      install bash base-files \
+    || add_warning "could not reinstall bash/base-files defaults (lock held or mirror unreachable)"
 
   [[ -f /etc/skel/.bashrc ]] || add_warning "/etc/skel/.bashrc missing"
 
@@ -1009,9 +1057,13 @@ report_results() {
   echo "Logs: $MAIN_LOG  $UPGRADE_LOG (tmpfs, gone on reboot)"
 }
 
+echo "If this terminal drops, the script keeps running. Reattach with: tail -f $MAIN_LOG"
+echo
+
 run_all_steps
 
 # Passwords are no longer needed.
 unset NEW_USER_PASSWORD NEW_ROOT_PASSWORD
 
-report_results
+# Also save the report to a file in case the terminal is gone by now.
+report_results | tee --output-error=warn "$FINAL_REPORT_FILE"
