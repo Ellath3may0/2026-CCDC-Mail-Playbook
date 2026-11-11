@@ -104,6 +104,7 @@ readonly UPGRADE_LOG UPGRADE_PID_FILE UPGRADE_STATUS_FILE FINAL_REPORT_FILE PURG
 
 : > "$MAIN_LOG"
 : > "$WARNINGS_FILE"
+: > "$PREFLIGHT_FINDINGS_FILE"
 
 # Options for every apt-get call: non-interactive, wait up to 30 min for the
 # dpkg lock (the background upgrade holds it), keep existing config files.
@@ -230,6 +231,129 @@ protected_pids() {
 
 build_owned_path_index
 quiesce_background_apt_jobs
+
+
+# =============================================================================
+# 1b. SHELL ENVIRONMENT CLEAN (runs BEFORE pre-flight)
+# =============================================================================
+# Nothing below may trust inherited shell state (profiles, PROMPT_COMMAND,
+# /etc/environment, ld.so.preload), so it is reset before any check runs.
+
+# reinstall_shell_packages
+#   apt update + reinstall of bash and base-files, with hard caps so it cannot hang.
+reinstall_shell_packages() {
+  local lock_holders modified_files
+
+  # If something holds the dpkg/apt lock, say who, so a stall is explainable.
+  if command -v fuser > /dev/null; then
+    lock_holders=$(fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>&1)
+    [[ -n $lock_holders ]] && echo "[reset] lock currently held by: $lock_holders"
+  fi
+
+  # Refresh package lists first: --reinstall fetches the exact installed version,
+  # which 404s if the lists are stale.
+  echo "[reset] $(date +%T) running apt-get update"
+  NEEDRESTART_SUSPEND=1 timeout -k 10 120 apt-get update \
+      -o DPkg::Lock::Timeout=90 \
+      -o Acquire::Retries=0 \
+      -o Acquire::http::Timeout=15 \
+      -o Acquire::https::Timeout=15 \
+      < /dev/null \
+    || add_warning "apt-get update failed in profile reset step (lock held or mirror unreachable; see $MAIN_LOG)"
+
+  echo "[reset] $(date +%T) reinstalling bash and base-files with apt-get"
+
+  # Hard caps so this can never hang the run: 90 s waiting for the lock, 150 s total
+  # (then SIGKILL). No pty and no needrestart hook (it scans and can restart
+  # services, including ssh, mid-run), stdin closed so nothing can wait for input.
+  NEEDRESTART_SUSPEND=1 timeout -k 10 150 apt-get -y --reinstall \
+      -o Dpkg::Options::=--force-confnew \
+      -o DPkg::Lock::Timeout=90 \
+      -o Dpkg::Use-Pty=0 \
+      -o Acquire::Retries=0 \
+      -o Acquire::http::Timeout=15 \
+      -o Acquire::https::Timeout=15 \
+      install bash base-files < /dev/null \
+    || add_warning "could not reinstall bash/base-files defaults (lock held, stale package lists or mirror unreachable; see $MAIN_LOG)"
+
+  echo "[reset] $(date +%T) apt-get finished"
+
+  modified_files=$(
+    {
+      verify_modified_files bash base-files
+      dpkg --verify bash base-files 2>/dev/null | grep -E ' c /etc/(profile|bash\.bashrc|skel/)'
+    } | sort -u
+  )
+  [[ -n $modified_files ]] \
+    && add_warning "bash/base-files STILL modified after reinstall: $(head -5 <<< "$modified_files" | tr '\n' ';')"
+}
+
+# Restore Ubuntu default shell profiles for root and sysadmin, remove injected
+# PROMPT_COMMAND and environment variables, and drop LD_PRELOAD config.
+step_reset_shell_profiles() {
+  local account home_dir modified_files
+
+  # The shell defaults come from the bash and base-files packages. Scan them with
+  # dpkg first and only touch apt if something was changed. verify_modified_files
+  # skips config files, so the ones that matter here (/etc/profile, bash.bashrc and
+  # the /etc/skel dotfiles) are checked explicitly as well.
+  echo "[reset] $(date +%T) scanning bash and base-files with dpkg --verify"
+  modified_files=$(
+    {
+      verify_modified_files bash base-files
+      dpkg --verify bash base-files 2>/dev/null | grep -E ' c /etc/(profile|bash\.bashrc|skel/)'
+    } | sort -u
+  )
+
+  if [[ -z $modified_files ]]; then
+    echo "[reset] $(date +%T) scan clean, skipping apt-get"
+  else
+    echo "[reset] modified files found:"
+    echo "$modified_files"
+    add_warning "bash/base-files failed dpkg verification: $(head -5 <<< "$modified_files" | tr '\n' ';')"
+
+    if ((NO_PACKAGE_CHANGES)); then
+      report_only_note "bash/base-files failed verification, would run: apt-get update; apt-get --reinstall install bash base-files"
+    else
+      reinstall_shell_packages
+    fi
+  fi
+
+  echo "[reset] $(date +%T) resetting profiles"
+
+  [[ -f /etc/skel/.bashrc ]] || add_warning "/etc/skel/.bashrc missing"
+
+  if [[ -s /etc/ld.so.preload ]]; then
+    add_preflight_finding "/etc/ld.so.preload existed (removed by shell reset): $(tr '\n' ' ' < /etc/ld.so.preload)"
+  fi
+  rm -f /etc/ld.so.preload
+
+  # /etc/environment keeps only PATH.
+  grep -E '^PATH=' /etc/environment > "$WORK_DIR/environment.keep" 2>/dev/null
+  cat "$WORK_DIR/environment.keep" > /etc/environment
+
+  sed -i '/PROMPT_COMMAND/d' /etc/profile.d/*.sh 2>/dev/null
+
+  for account in root sysadmin; do
+    # Local accounts only: a plain getent would query sssd/LDAP and can stall.
+    home_dir=$(getent -s files passwd "$account" | cut -d: -f6)
+    [[ -d $home_dir ]] || continue
+
+    rm -f "$home_dir"/.bashrc "$home_dir"/.profile "$home_dir"/.bash_profile \
+          "$home_dir"/.bash_login "$home_dir"/.bash_logout "$home_dir"/.bash_aliases \
+          "$home_dir"/.inputrc
+
+    cp /etc/skel/.bashrc /etc/skel/.profile /etc/skel/.bash_logout "$home_dir"/
+
+    chown "$account:$(id -gn "$account")" "$home_dir"/.bashrc "$home_dir"/.profile "$home_dir"/.bash_logout
+    chmod 644 "$home_dir"/.bashrc "$home_dir"/.profile "$home_dir"/.bash_logout
+  done
+}
+
+echo "Cleaning shell environment (before pre-flight)"
+step_reset_shell_profiles >> "$MAIN_LOG" 2>&1
+echo "  done. Log: $MAIN_LOG"
+echo
 
 
 # =============================================================================
@@ -403,7 +527,6 @@ run_preflight() {
   local answer
   local background_scan_pids=()
 
-  : > "$PREFLIGHT_FINDINGS_FILE"
   collect_ancestor_pids
 
   echo "Pre-flight: keylogger checks (before any password is typed)"
@@ -492,114 +615,6 @@ PURGE_LIST_EOF
 # =============================================================================
 # 3. STEPS (each runs in the background, output goes to MAIN_LOG)
 # =============================================================================
-
-# reinstall_shell_packages
-#   apt update + reinstall of bash and base-files, with hard caps so it cannot hang.
-reinstall_shell_packages() {
-  local lock_holders modified_files
-
-  # If something holds the dpkg/apt lock, say who, so a stall is explainable.
-  if command -v fuser > /dev/null; then
-    lock_holders=$(fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>&1)
-    [[ -n $lock_holders ]] && echo "[reset] lock currently held by: $lock_holders"
-  fi
-
-  # Refresh package lists first: --reinstall fetches the exact installed version,
-  # which 404s if the lists are stale.
-  echo "[reset] $(date +%T) running apt-get update"
-  NEEDRESTART_SUSPEND=1 timeout -k 10 120 apt-get update \
-      -o DPkg::Lock::Timeout=90 \
-      -o Acquire::Retries=0 \
-      -o Acquire::http::Timeout=15 \
-      -o Acquire::https::Timeout=15 \
-      < /dev/null \
-    || add_warning "apt-get update failed in profile reset step (lock held or mirror unreachable; see $MAIN_LOG)"
-
-  echo "[reset] $(date +%T) reinstalling bash and base-files with apt-get"
-
-  # Hard caps so this can never hang the run: 90 s waiting for the lock, 150 s total
-  # (then SIGKILL). No pty and no needrestart hook (it scans and can restart
-  # services, including ssh, mid-run), stdin closed so nothing can wait for input.
-  NEEDRESTART_SUSPEND=1 timeout -k 10 150 apt-get -y --reinstall \
-      -o Dpkg::Options::=--force-confnew \
-      -o DPkg::Lock::Timeout=90 \
-      -o Dpkg::Use-Pty=0 \
-      -o Acquire::Retries=0 \
-      -o Acquire::http::Timeout=15 \
-      -o Acquire::https::Timeout=15 \
-      install bash base-files < /dev/null \
-    || add_warning "could not reinstall bash/base-files defaults (lock held, stale package lists or mirror unreachable; see $MAIN_LOG)"
-
-  echo "[reset] $(date +%T) apt-get finished"
-
-  modified_files=$(
-    {
-      verify_modified_files bash base-files
-      dpkg --verify bash base-files 2>/dev/null | grep -E ' c /etc/(profile|bash\.bashrc|skel/)'
-    } | sort -u
-  )
-  [[ -n $modified_files ]] \
-    && add_warning "bash/base-files STILL modified after reinstall: $(head -5 <<< "$modified_files" | tr '\n' ';')"
-}
-
-# Restore Ubuntu default shell profiles for root and sysadmin, remove injected
-# PROMPT_COMMAND and environment variables, and drop LD_PRELOAD config.
-step_reset_shell_profiles() {
-  local account home_dir modified_files
-
-  # The shell defaults come from the bash and base-files packages. Scan them with
-  # dpkg first and only touch apt if something was changed. verify_modified_files
-  # skips config files, so the ones that matter here (/etc/profile, bash.bashrc and
-  # the /etc/skel dotfiles) are checked explicitly as well.
-  echo "[reset] $(date +%T) scanning bash and base-files with dpkg --verify"
-  modified_files=$(
-    {
-      verify_modified_files bash base-files
-      dpkg --verify bash base-files 2>/dev/null | grep -E ' c /etc/(profile|bash\.bashrc|skel/)'
-    } | sort -u
-  )
-
-  if [[ -z $modified_files ]]; then
-    echo "[reset] $(date +%T) scan clean, skipping apt-get"
-  else
-    echo "[reset] modified files found:"
-    echo "$modified_files"
-    add_warning "bash/base-files failed dpkg verification: $(head -5 <<< "$modified_files" | tr '\n' ';')"
-
-    if ((NO_PACKAGE_CHANGES)); then
-      report_only_note "bash/base-files failed verification, would run: apt-get update; apt-get --reinstall install bash base-files"
-    else
-      reinstall_shell_packages
-    fi
-  fi
-
-  echo "[reset] $(date +%T) resetting profiles"
-
-  [[ -f /etc/skel/.bashrc ]] || add_warning "/etc/skel/.bashrc missing"
-
-  rm -f /etc/ld.so.preload
-
-  # /etc/environment keeps only PATH.
-  grep -E '^PATH=' /etc/environment > "$WORK_DIR/environment.keep" 2>/dev/null
-  cat "$WORK_DIR/environment.keep" > /etc/environment
-
-  sed -i '/PROMPT_COMMAND/d' /etc/profile.d/*.sh 2>/dev/null
-
-  for account in root sysadmin; do
-    # Local accounts only: a plain getent would query sssd/LDAP and can stall.
-    home_dir=$(getent -s files passwd "$account" | cut -d: -f6)
-    [[ -d $home_dir ]] || continue
-
-    rm -f "$home_dir"/.bashrc "$home_dir"/.profile "$home_dir"/.bash_profile \
-          "$home_dir"/.bash_login "$home_dir"/.bash_logout "$home_dir"/.bash_aliases \
-          "$home_dir"/.inputrc
-
-    cp /etc/skel/.bashrc /etc/skel/.profile /etc/skel/.bash_logout "$home_dir"/
-
-    chown "$account:$(id -gn "$account")" "$home_dir"/.bashrc "$home_dir"/.profile "$home_dir"/.bash_logout
-    chmod 644 "$home_dir"/.bashrc "$home_dir"/.profile "$home_dir"/.bash_logout
-  done
-}
 
 # Set the new passwords collected during pre-flight.
 step_change_passwords() {
@@ -1165,7 +1180,7 @@ step_reload_systemd() {
 #     Integrity must finish before any apt step starts, otherwise dpkg --verify
 #     could see a half-installed package and report false tampering.
 #
-#   Step 1 (profile reset) runs first and alone, before passwords are applied.
+#   The profile reset is not a step: it runs before pre-flight (section 1b).
 #
 #   Group 2 (apt chain: fish -> root shell -> snap):
 #     runs alongside the bootloader check (grub, initramfs, no apt unless tampered).
@@ -1179,7 +1194,6 @@ step_reload_systemd() {
 # nftbuild (unknown side effects), and daemon-reload (must see every change).
 
 readonly -a STEPS=(
-  "5|Reset shell profiles and PROMPT_COMMAND|step_reset_shell_profiles"
   "2|Change user and root passwords|step_change_passwords"
 
   "2|Kill other shell sessions|step_kill_other_sessions"
@@ -1223,7 +1237,7 @@ readonly -a OVERLAPPED_STEPS=(
 
 # Steps that call apt-get. A notice is printed on the terminal when they start.
 readonly -a APT_STEPS=(
-  step_reset_shell_profiles step_check_binary_integrity step_install_fish
+  step_check_binary_integrity step_install_fish
   step_remove_snap step_check_bootloader step_start_background_upgrade
 )
 
