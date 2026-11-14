@@ -1,0 +1,27 @@
+compatibility_level = 3.6
+myhostname = mail
+mydomain = ccdc.net
+myorigin = $mydomain
+inet_interfaces = all
+inet_protocols = ipv4
+mydestination = localhost
+mynetworks = 127.0.0.0/8
+mailbox_size_limit = 0
+recipient_delimiter = +
+
+virtual_mailbox_domains = ccdc.net
+virtual_mailbox_maps = ldap:/etc/postfix/ldap-users.cf
+virtual_mailbox_base = /var/mail/vhosts/
+virtual_transport = lmtp:unix:private/dovecot-lmtp
+
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = private/auth
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_security_options = noanonymous
+broken_sasl_auth_clients = yes
+
+smtpd_tls_security_level = none
+smtp_tls_security_level = none
+
+smtpd_relay_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination
+smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination

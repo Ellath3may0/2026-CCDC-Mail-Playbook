@@ -1,0 +1,10 @@
+uris = ldap://172.20.240.100
+dn = CN=mail,OU=ServiceAccounts,DC=ccdc,DC=net
+dnpass = Pa$$w0rd
+ldap_version = 3
+tls = no
+auth_bind = yes
+base = DC=ccdc,DC=net
+scope = subtree
+pass_filter = (&(objectClass=user)(sAMAccountName=%n))
+pass_attrs = sAMAccountName=user
