@@ -15,5 +15,10 @@ Update bootloader before even thinking about restarting
 
 [Megascript Short](https://tinyurl.com/inv-mega)
 [MegaScript](https://raw.githubusercontent.com/UWStout-CCDC/CCDC-scripts/refs/heads/master/linux/mail/megascript.sh)
-[Defender Binary](https://raw.githubusercontent.com/UWStout-CCDC/CCDC-scripts/refs/heads/master/linux/defender/linux-defender-1.0.0)
+[Defender Binary](https://raw.githubusercontent.com/UWStout-CCDC/CCDC-scripts/refs/heads/master/linux/defender/linux-defender-1.0.46)
 [Defender Github](https://github.com/Slavetomints/linux-defender)
+
+## Passwords
+
+- sysadmin: smallnail33
+- root:     broadiguana26
