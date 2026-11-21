@@ -10,6 +10,12 @@ Update bootloader before even thinking about restarting
   `wget https://raw.githubusercontent.com/UWStout-CCDC/CCDC-scripts/refs/heads/master/linux/defender/linux-defender-1.0.0 && chmod +x linux-defender-1.0.0 && sudo ./linux-defender-1.0.0`
 - Force-Reinstall with configs:
   `apt install --reinstall -o Dpkg::Options::="--force-confask,confnew,confmiss" <package-name>`
+- Dovecot auth test
+  `sudo doveadm auth test <user>@<domain>`
+- AD auth test
+ `getent passwd <user>@<domain>`
+- Test mail
+  `echo "b" | mail -s "s" <receiving user>@<domain>`
 
 ## Important Links
 
